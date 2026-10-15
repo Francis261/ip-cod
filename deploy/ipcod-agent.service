@@ -1,0 +1,34 @@
+[Unit]
+Description=ipcod agent (VPS firewall sync)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ipcod/agent.env
+ExecStart=/usr/local/bin/ipcod-agent
+Restart=on-failure
+RestartSec=3
+
+# The agent MUST run as root (or with passwordless sudo for ufw) because
+# updating ufw requires privileges. We grant only what's needed via the
+# ambient capability for the ufw/netfilter writes instead of full root where
+# possible, but ufw itself typically needs real root; we therefore keep root
+# but harden everything else.
+User=root
+
+NoNewPrivileges=no
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=no
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# The agent only makes outbound connections to the coordinator.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# ufw needs to manage netfilter; allow the specific sysctls it touches.
+ProtectKernelModules=no
+
+[Install]
+WantedBy=multi-user.target

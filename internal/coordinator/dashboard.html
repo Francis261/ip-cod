@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ipcod — IP Coordinator</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --border:#262b36; --fg:#e6e9ef; --muted:#8b93a7; --accent:#4c8dff; --ok:#3fb950; --bad:#f85149; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; align-items:center; justify-content:space-between; padding:14px 22px; border-bottom:1px solid var(--border); }
+  header h1 { font-size:16px; margin:0; letter-spacing:.3px; }
+  header h1 span { color:var(--accent); }
+  main { max-width:1000px; margin:0 auto; padding:22px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:18px; margin-bottom:18px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); margin:0 0 12px; }
+  .row { display:flex; gap:18px; flex-wrap:wrap; }
+  .stat { flex:1; min-width:140px; }
+  .stat .k { color:var(--muted); font-size:12px; }
+  .stat .v { font-size:22px; font-weight:600; margin-top:2px; word-break:break-all; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); font-size:13px; }
+  th { color:var(--muted); font-weight:500; }
+  button { background:var(--accent); border:0; color:#fff; padding:8px 12px; border-radius:7px; cursor:pointer; font-size:13px; }
+  button.ghost { background:transparent; border:1px solid var(--border); color:var(--fg); }
+  button.danger { background:transparent; border:1px solid var(--bad); color:var(--bad); }
+  input { background:#0c0e12; border:1px solid var(--border); color:var(--fg); padding:8px 10px; border-radius:7px; font-size:13px; width:100%; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  .form-grid { display:grid; grid-template-columns:1fr 120px 100px auto; gap:10px; align-items:end; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:20px; font-size:11px; }
+  .pill.on { background:rgba(63,185,80,.15); color:var(--ok); }
+  .pill.off { background:rgba(248,81,73,.15); color:var(--bad); }
+  .token { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; background:#0c0e12; border:1px dashed var(--border); padding:8px; border-radius:7px; word-break:break-all; }
+  .muted { color:var(--muted); }
+  #login { max-width:360px; margin:80px auto; }
+  .err { color:var(--bad); font-size:13px; min-height:18px; }
+</style>
+</head>
+<body>
+<div id="login" class="card">
+  <h2>Admin login</h2>
+  <label>Admin bearer token</label>
+  <input id="pw" type="password" placeholder="admin token" autocomplete="current-password">
+  <div class="err" id="loginErr"></div>
+  <button style="width:100%" onclick="doLogin()">Sign in</button>
+  <p class="muted" style="font-size:12px;margin-top:12px">
+    This is the admin bearer token you set via <code>IPCOD_ADMIN_TOKEN</code> when starting the coordinator.
+  </p>
+</div>
+
+<div id="app" style="display:none">
+  <header>
+    <h1><span>ipcod</span> &middot; IP Coordinator</h1>
+    <button class="ghost" onclick="logout()">Sign out</button>
+  </header>
+  <main>
+    <div class="card">
+      <h2>Current laptop IP</h2>
+      <div class="row">
+        <div class="stat"><div class="k">IP</div><div class="v" id="ip">—</div></div>
+        <div class="stat"><div class="k">Revision</div><div class="v" id="rev">—</div></div>
+        <div class="stat"><div class="k">Last changed</div><div class="v" id="changed" style="font-size:15px">—</div></div>
+        <div class="stat"><div class="k">Agents connected</div><div class="v" id="conn">—</div></div>
+      </div>
+      <div style="margin-top:14px" class="form-grid">
+        <div><label>Force IP (manual override)</label><input id="manualIp" placeholder="203.0.113.7"></div>
+        <div style="grid-column:span 3"><button onclick="setIP()">Push IP to agents</button></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Agents</h2>
+      <table><thead><tr><th>Name</th><th>Port</th><th>Status</th><th>Last IP</th><th>Last seen</th><th></th></tr></thead>
+      <tbody id="agents"></tbody></table>
+      <div style="margin-top:16px" class="form-grid">
+        <div><label>Name</label><input id="aName" placeholder="web-1"></div>
+        <div><label>Port</label><input id="aPort" type="number" placeholder="22"></div>
+        <div><label>Proto</label><input id="aProto" placeholder="tcp"></div>
+        <div><button onclick="createAgent()">Add agent</button></div>
+      </div>
+      <div class="token" id="agentTokenBox" style="display:none; margin-top:12px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Beacons (laptops)</h2>
+      <table><thead><tr><th>Name</th><th>Status</th><th>Last IP</th><th>Last seen</th><th></th></tr></thead>
+      <tbody id="beacons"></tbody></table>
+      <div style="margin-top:16px" class="form-grid">
+        <div><label>Name</label><input id="bName" placeholder="my-laptop"></div>
+        <div style="grid-column:span 3"><button onclick="createBeacon()">Add beacon</button></div>
+      </div>
+      <div class="token" id="beaconTokenBox" style="display:none; margin-top:12px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Recent IP history</h2>
+      <table><thead><tr><th>IP</th><th>Beacon</th><th>When</th></tr></thead>
+      <tbody id="history"></tbody></table>
+    </div>
+  </main>
+</div>
+
+<script>
+const TOKEN_KEY = 'ipcod_admin_token';
+let TOKEN = sessionStorage.getItem(TOKEN_KEY) || '';
+
+async function api(path, opts = {}) {
+  opts.headers = Object.assign({'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json'}, opts.headers || {});
+  const r = await fetch(path, opts);
+  if (r.status === 401) { logout(); throw new Error('unauthorized'); }
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
+  return body;
+}
+
+function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function doLogin() {
+  TOKEN = document.getElementById('pw').value.trim();
+  document.getElementById('loginErr').textContent = '';
+  try {
+    await api('/api/admin/status');
+    sessionStorage.setItem(TOKEN_KEY, TOKEN);
+    showApp();
+  } catch (e) {
+    document.getElementById('loginErr').textContent = 'Login failed: ' + e.message;
+  }
+}
+function logout(){ TOKEN=''; sessionStorage.removeItem(TOKEN_KEY); location.reload(); }
+
+function showApp(){
+  document.getElementById('login').style.display='none';
+  document.getElementById('app').style.display='block';
+  refresh();
+  setInterval(refresh, 4000);
+}
+
+async function refresh(){
+  try {
+    const st = await api('/api/admin/status');
+    document.getElementById('ip').textContent = st.ip || '(none)';
+    document.getElementById('rev').textContent = st.revision;
+    document.getElementById('changed').textContent = st.changed_at || '—';
+    document.getElementById('conn').textContent = st.connected_agents;
+  } catch(e){}
+
+  try {
+    const {agents} = await api('/api/admin/agents');
+    document.getElementById('agents').innerHTML = agents.map(a => `<tr>
+      <td>${esc(a.name)}</td>
+      <td>${esc(a.port)}/${esc(a.proto||'tcp')}</td>
+      <td><span class="pill ${a.connected?'on':'off'}">${a.connected?'connected':'offline'}</span></td>
+      <td>${esc(a.last_ip)||'—'}</td>
+      <td>${esc(a.last_seen)||'—'}</td>
+      <td>
+        <button class="ghost" onclick="rotateAgent('${a.id}')">Rotate token</button>
+        <button class="danger" onclick="delAgent('${a.id}')">Delete</button>
+      </td></tr>`).join('') || '<tr><td colspan=6 class=muted>No agents yet.</td></tr>';
+  } catch(e){}
+
+  try {
+    const {beacons} = await api('/api/admin/beacons');
+    document.getElementById('beacons').innerHTML = beacons.map(b => `<tr>
+      <td>${esc(b.name)}</td>
+      <td><span class="pill ${b.enabled?'on':'off'}">${b.enabled?'enabled':'disabled'}</span></td>
+      <td>${esc(b.last_ip)||'—'}</td>
+      <td>${esc(b.last_seen)||'—'}</td>
+      <td>
+        <button class="ghost" onclick="rotateBeacon('${b.id}')">Rotate token</button>
+        <button class="danger" onclick="delBeacon('${b.id}')">Delete</button>
+      </td></tr>`).join('') || '<tr><td colspan=5 class=muted>No beacons yet.</td></tr>';
+  } catch(e){}
+
+  try {
+    const {history} = await api('/api/admin/ip-history?limit=15');
+    document.getElementById('history').innerHTML = history.map(h => `<tr>
+      <td>${esc(h.ip)}</td><td>${esc(h.beacon_id)}</td><td>${esc(h.changed_at)}</td></tr>`).join('')
+      || '<tr><td colspan=3 class=muted>No history yet.</td></tr>';
+  } catch(e){}
+}
+
+async function setIP(){
+  const ip = document.getElementById('manualIp').value.trim();
+  if(!ip) return alert('Enter an IP');
+  try { await api('/api/admin/ip', {method:'POST', body: JSON.stringify({ip})}); refresh(); }
+  catch(e){ alert(e.message); }
+}
+
+async function createAgent(){
+  const name = document.getElementById('aName').value.trim();
+  const port = parseInt(document.getElementById('aPort').value, 10);
+  const proto = document.getElementById('aProto').value.trim() || 'tcp';
+  if(!name || !port) return alert('Name and port required');
+  try {
+    const res = await api('/api/admin/agents', {method:'POST', body: JSON.stringify({name, port, proto})});
+    const box = document.getElementById('agentTokenBox');
+    box.style.display='block';
+    box.textContent = 'Agent "' + res.agent.name + '" token (copy now, shown once): ' + res.token;
+    document.getElementById('aName').value=''; document.getElementById('aPort').value='';
+    refresh();
+  } catch(e){ alert(e.message); }
+}
+
+async function rotateAgent(id){
+  if(!confirm('Rotate token? The agent must be redeployed with the new token.')) return;
+  try {
+    const res = await api('/api/admin/agents/'+id+'/rotate', {method:'POST'});
+    const box = document.getElementById('agentTokenBox');
+    box.style.display='block'; box.textContent = 'New agent token: ' + res.token;
+  } catch(e){ alert(e.message); }
+}
+async function delAgent(id){ if(confirm('Delete this agent?')){ try{ await api('/api/admin/agents/'+id,{method:'DELETE'}); refresh(); }catch(e){alert(e.message);} } }
+
+async function createBeacon(){
+  const name = document.getElementById('bName').value.trim();
+  if(!name) return alert('Name required');
+  try {
+    const res = await api('/api/admin/beacons', {method:'POST', body: JSON.stringify({name})});
+    const box = document.getElementById('beaconTokenBox');
+    box.style.display='block'; box.textContent = 'Beacon "' + res.beacon.name + '" token (copy now, shown once): ' + res.token;
+    document.getElementById('bName').value='';
+    refresh();
+  } catch(e){ alert(e.message); }
+}
+async function rotateBeacon(id){
+  if(!confirm('Rotate beacon token?')) return;
+  try { const res = await api('/api/admin/beacons/'+id+'/rotate', {method:'POST'});
+    const box = document.getElementById('beaconTokenBox'); box.style.display='block'; box.textContent='New beacon token: '+res.token;
+  } catch(e){ alert(e.message); }
+}
+async function delBeacon(id){ if(confirm('Delete this beacon?')){ try{ await api('/api/admin/beacons/'+id,{method:'DELETE'}); refresh(); }catch(e){alert(e.message);} } }
+
+if(TOKEN){ showApp(); }
+document.getElementById('pw').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+</script>
+</body>
+</html>

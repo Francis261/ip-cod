@@ -1,0 +1,27 @@
+# Build output
+/dist/
+
+# Compiled binaries (in case someone builds in-tree)
+/ipcod
+/ipcod-agent
+/ipcod-beacon
+/ipcod-coordinator
+
+# Runtime data / local state
+*.db
+*.db-shm
+*.db-wal
+ipcod.db
+
+# Env files that may contain real tokens
+deploy/*.env
+!/deploy/*.env.example
+*.env
+!.env.example
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
