@@ -15,7 +15,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/ipcod-beacon.env
-ExecStart=/usr/local/bin/ipcod-beacon
+ExecStart=/usr/local/bin/ipcod-beacon run
 Restart=on-failure
 RestartSec=5
 

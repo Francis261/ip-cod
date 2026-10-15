@@ -6,18 +6,20 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/ipcod/agent.env
-ExecStart=/usr/local/bin/ipcod-agent
+ExecStart=/usr/local/bin/ipcod-agent run
 Restart=on-failure
 RestartSec=3
 
-# The agent MUST run as root (or with passwordless sudo for ufw) because
-# updating ufw requires privileges. We grant only what's needed via the
-# ambient capability for the ufw/netfilter writes instead of full root where
-# possible, but ufw itself typically needs real root; we therefore keep root
-# but harden everything else.
+# The agent MUST run as root because updating ufw requires privileges (it
+# writes /etc/ufw/*.rules and manipulates netfilter). We keep root but harden
+# the sandbox around it.
 User=root
 
 NoNewPrivileges=no
+# NOTE: ProtectSystem must stay "full", NOT "strict". "full" makes /usr and
+# /boot read-only but leaves /etc writable, which ufw needs to persist rules
+# to /etc/ufw/. Switching to "strict" makes the whole tree read-only and ufw
+# allow/deny will silently fail to save rules across reloads.
 ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes

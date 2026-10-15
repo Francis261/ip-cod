@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 # All config comes from environment; see deploy/coordinator.env.example.
 EnvironmentFile=/etc/ipcod/coordinator.env
-ExecStart=/usr/local/bin/ipcod-coordinator
+ExecStart=/usr/local/bin/ipcod-coordinator run
 Restart=on-failure
 RestartSec=3
 
