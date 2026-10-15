@@ -130,7 +130,21 @@ info "installing binary -> /usr/local/bin/ipcod-coordinator"
 install -m 0755 "$BIN" /usr/local/bin/ipcod-coordinator
 
 info "writing $ENV_FILE"
-mkdir -p /etc/ipcod /var/lib/ipcod
+mkdir -p /etc/ipcod
+# systemd's DynamicUser + StateDirectory=ipcod must own /var/lib/ipcod itself
+# (it materialises as a symlink into /var/lib/private). Pre-creating the
+# directory as root — or leaving one behind — makes the unit die at startup
+# with status=238/STATE_DIRECTORY. So clear an empty leftover, and move a
+# non-empty one aside instead of silently fighting systemd for it.
+if [ -d /var/lib/ipcod ] && [ ! -L /var/lib/ipcod ]; then
+  if [ -n "$(ls -A /var/lib/ipcod 2>/dev/null)" ]; then
+    BAK="/var/lib/ipcod.bak.$(date +%Y%m%d%H%M%S)"
+    mv /var/lib/ipcod "$BAK"
+    good "moved existing /var/lib/ipcod aside -> $BAK (move the .db back if you need that data)"
+  else
+    rmdir /var/lib/ipcod
+  fi
+fi
 if [ -f "$ENV_FILE" ]; then
   cp -a "$ENV_FILE" "$ENV_FILE.bak.$(date +%Y%m%d%H%M%S)"
   good "backed up existing env to $ENV_FILE.bak.*"
