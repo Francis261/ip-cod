@@ -4,6 +4,7 @@
 #   make build            build all binaries for the host platform
 #   make test             run unit tests + vet
 #   make release          cross-compile static binaries for common VPS targets
+#   make manage           run the interactive lifecycle manager (see ./manage.sh help)
 #   make install-agent    install the agent + systemd unit on this host (needs root)
 #
 # Binaries produced in dist/:
@@ -22,9 +23,14 @@ OUT      = dist
 # we cover both amd64 and arm64 (common VPS arches, incl. Graviton / Oracle ARM).
 PLATFORMS = linux/amd64 linux/arm64
 
-.PHONY: all build test vet release clean install-agent
+.PHONY: all build test vet release clean manage install-agent
 
 all: build
+
+# Interactive lifecycle manager for the coordinator/agent/beacon:
+# setup, start/stop/restart, logs, health checks, token + agent CRUD.
+manage:
+	./manage.sh
 
 build:
 	@mkdir -p $(OUT)

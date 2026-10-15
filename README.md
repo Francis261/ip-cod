@@ -107,6 +107,46 @@ IPCOD_TOKEN=ipcb_yyy ./dist/ipcod-beacon run -v
 Watch the agent log print `firewall updated …` and, in dry-run, the exact
 `ufw allow from <ip> to any port <port> proto tcp comment ipcod` it would run.
 
+## manage.sh — one script to run it all
+
+`manage.sh` at the repo root is a menu-driven front door for all three
+components. Run it with no arguments for the menu, or pass a command to script
+it:
+
+```bash
+./manage.sh                      # interactive menu (status/setup/start/…)
+
+sudo ./manage.sh setup coordinator     # delegates to deploy/install-coordinator.sh
+COORD=wss://coord.example.com/ws TOKEN=ipca_xxx ./manage.sh setup agent
+COORD=coord.example.com TOKEN=ipcb_yyy ./manage.sh setup beacon   # laptop, systemd --user
+
+./manage.sh status               # services + current IP + connected agents
+./manage.sh health               # healthz + `agent check` + `beacon once`
+./manage.sh logs agent -f        # journalctl (or the dev log) for a component
+./manage.sh restart beacon
+./manage.sh create-agent web-1 22        # via the admin API; token shown once
+./manage.sh -y rotate agent web-1        # rotates AND rewrites the local env + restarts
+./manage.sh dry-run on           # flip the agent between log-only and live ufw
+./manage.sh -y ip 203.0.113.7    # force-push an IP
+./manage.sh -y uninstall coordinator     # asks first; DB purge is a second question
+```
+
+Notes:
+
+- **systemd when available, processes otherwise.** On a systemd host it drives
+  `ipcod-coordinator` / `ipcod-agent` (system units) and `ipcod-beacon`
+  (user unit, with optional lingering). Without systemd — or with
+  `IPCOD_DEV=1` — it runs plain background processes with pidfiles and logs
+  under `~/.local/state/ipcod`, which is handy for trying it out locally.
+- **`setup` reconfigures too**, not just installs: it pre-fills every prompt
+  from the existing config and restarts the service so changes take effect.
+- **`-y` / `IPCOD_YES=1`** pre-answers the destructive confirmations, so the
+  script is usable from cron/CI. Tokens are still printed exactly once.
+- **Admin API calls** go to the local coordinator's loopback address by
+  default; override with `IPCOD_URL=…` or `IPCOD_ADMIN_TOKEN=…` to drive a
+  remote coordinator from your laptop.
+- `./manage.sh help` prints the full command reference.
+
 ## Production deployment
 
 ### 1. Coordinator (with TLS)
@@ -152,7 +192,15 @@ journalctl -u ipcod-agent -f
 
 ### 3. Beacon (on your laptop)
 
-The beacon is a user-level process. On Linux with systemd:
+The beacon is a user-level process. On Linux with systemd, `manage.sh` can set
+it up for you (writes `~/.config/ipcod-beacon.env`, installs the user unit,
+optionally enables lingering):
+
+```bash
+COORD=coord.example.com TOKEN=ipcb_yyy ./manage.sh setup beacon
+```
+
+Or do it by hand:
 
 ```bash
 mkdir -p ~/.config/systemd/user ~/.local/bin
@@ -281,6 +329,7 @@ ipcod-coordinator gen-admin-token
 ## Project layout
 
 ```
+manage.sh          interactive/scriptable lifecycle manager for all three roles
 cmd/ipcod           unified binary (coordinator/agent/beacon as subcommands)
 cmd/coordinator     standalone coordinator binary
 cmd/agent           standalone agent binary
