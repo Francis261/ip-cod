@@ -2,11 +2,13 @@
 #
 # manage.sh — interactive lifecycle manager for ipcod.
 #
-# One script to set up and operate all three roles:
+# One script to set up and operate both roles:
 #
-#   coordinator  the IP-push server (systemd: ipcod-coordinator)
+#   coordinator  the control plane (systemd: ipcod-coordinator). Run it on
+#                your laptop: it detects your public IP itself, pushes
+#                changes to agents, and serves the web dashboard on demand
+#                (`./manage.sh web 8443`).
 #   agent        the per-VPS firewall daemon (systemd: ipcod-agent)
-#   beacon       the laptop IP reporter (systemd --user: ipcod-beacon)
 #
 # Interactive (menu-driven) by default:
 #
@@ -16,8 +18,8 @@
 #
 #   ./manage.sh status
 #   sudo ./manage.sh setup coordinator
-#   ./manage.sh restart beacon
-#   ./manage.sh logs agent --follow
+#   ./manage.sh restart agent
+#   ./manage.sh web 8443
 #   ./manage.sh create-agent web-1 22
 #   ./manage.sh ip 203.0.113.7
 #   ./manage.sh help
@@ -33,19 +35,16 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$REPO_DIR/dist"
 DEPLOY="$REPO_DIR/deploy"
 
-COMPONENTS="coordinator agent beacon"
+COMPONENTS="coordinator agent"
 
 COORD_UNIT=ipcod-coordinator
 AGENT_UNIT=ipcod-agent
-BEACON_UNIT=ipcod-beacon
 
 COORD_ENV=/etc/ipcod/coordinator.env
 AGENT_ENV=/etc/ipcod/agent.env
-BEACON_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/ipcod-beacon.env"
 
 COORD_BIN=/usr/local/bin/ipcod-coordinator
 AGENT_BIN=/usr/local/bin/ipcod-agent
-BEACON_BIN="$HOME/.local/bin/ipcod-beacon"
 
 STATE_DIR="${IPCOD_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ipcod}"
 LOG_DIR="$STATE_DIR/logs"
@@ -66,7 +65,7 @@ die(){  printf '%s\n' "${RD}✗${R} $*" >&2; exit 1; }
 
 banner(){
   printf '\n%s\n' "${B}════════════════════════════════════════${R}"
-  printf '%s\n'   "${B} ipcod manage — coordinator/agent/beacon${R}"
+  printf '%s\n'   "${B} ipcod manage — coordinator/agent${R}"
   printf '%s\n\n' "${B}════════════════════════════════════════${R}"
 }
 
@@ -104,15 +103,15 @@ confirm(){  # confirm "message" y|n -> $REPLY (honours -y/--yes)
   done
 }
 
-pick_comp(){ # [coordinator/agent/beacon] -> $REPLY (prompts when omitted)
+pick_comp(){ # [coordinator/agent] -> $REPLY (prompts when omitted)
   local r="${1:-}"
   case "$r" in
     co*|c|1) REPLY=coordinator; return 0 ;;
     a*|2)    REPLY=agent;       return 0 ;;
-    b*|3)    REPLY=beacon;      return 0 ;;
+    b*|beacon|3) die "the beacon is gone — the coordinator now detects your public IP itself (see ./manage.sh status)" ;;
   esac
   if [ "$INTERACTIVE" = 1 ]; then
-    printf '  %s1)%s coordinator   %s2)%s agent   %s3)%s beacon\n' "$DIM" "$R" "$DIM" "$R" "$DIM" "$R"
+    printf '  %s1)%s coordinator   %s2)%s agent\n' "$DIM" "$R" "$DIM" "$R"
   fi
   while true; do
     [ "$INTERACTIVE" = 1 ] && printf 'Component: '
@@ -120,10 +119,10 @@ pick_comp(){ # [coordinator/agent/beacon] -> $REPLY (prompts when omitted)
     case "$r" in
       co*|c|1) REPLY=coordinator; return 0 ;;
       a*|2)    REPLY=agent;       return 0 ;;
-      b*|3)    REPLY=beacon;      return 0 ;;
-      *) [ "$INTERACTIVE" = 1 ] && printf '%s\n' "  answer coordinator, agent or beacon" ;;
+      b*|beacon|3) [ "$INTERACTIVE" = 1 ] && printf '%s\n' "  the beacon was folded into the coordinator — answer coordinator or agent" ;;
+      *) [ "$INTERACTIVE" = 1 ] && printf '%s\n' "  answer coordinator or agent" ;;
     esac
-    [ "$INTERACTIVE" = 1 ] || die "component must be coordinator, agent or beacon"
+    [ "$INTERACTIVE" = 1 ] || die "component must be coordinator or agent"
   done
 }
 
@@ -135,7 +134,6 @@ have_py(){ command_ok python3; }
 yn(){ case "${1:-}" in 1|y|Y|yes|true) printf 'y' ;; *) printf 'n' ;; esac; }
 
 systemd_ok(){ command_ok systemctl && [ -d /run/systemd/system ]; }
-user_systemd_ok(){ systemd_ok && systemctl --user show-environment >/dev/null 2>&1; }
 
 is_root(){ [ "$(id -u)" -eq 0 ]; }
 
@@ -196,7 +194,6 @@ env_set(){ # env_set FILE KEY VALUE (create-or-replace; escalates when needed)
 
 # ------------------------------------------------------------ URL normalizers
 #   ipcod.example.com / https://host  ->  wss://host/ws      (agent)
-#   ipcod.example.com / wss://host/ws ->  https://host/api/beacon (beacon)
 normalize_ws(){
   local u="${1%/}"
   case "$u" in
@@ -209,54 +206,30 @@ normalize_ws(){
   printf '%s' "$u"
 }
 
-normalize_beacon(){
-  local u="${1%/}"
-  case "$u" in
-    http://*|https://*) : ;;
-    ws://*)    u="https://${u#ws://}" ;;
-    wss://*)   u="https://${u#wss://}" ;;
-    *)         u="https://$u" ;;
-  esac
-  case "$u" in */api/beacon) : ;; *) u="$u/api/beacon" ;; esac
-  printf '%s' "$u"
-}
-
 # ------------------------------------------------------- component resolution
-comp_mode(){ # comp -> systemd | dev (beacon needs a systemd *user* session)
+comp_mode(){ # comp -> systemd | dev
   if [ "${IPCOD_DEV:-0}" = 1 ]; then printf 'dev'; return 0; fi   # force plain processes
-  if systemd_ok && { [ "$1" != beacon ] || user_systemd_ok; }; then
-    printf 'systemd'
-  else
-    printf 'dev'
-  fi
+  if systemd_ok; then printf 'systemd'; else printf 'dev'; fi
 }
 
 env_file(){ # comp -> config file used in the current mode
   case "$1" in
     coordinator) if [ "$(comp_mode "$1")" = systemd ]; then printf '%s' "$COORD_ENV"; else printf '%s' "$STATE_DIR/coordinator.env"; fi ;;
     agent)       if [ "$(comp_mode "$1")" = systemd ]; then printf '%s' "$AGENT_ENV";   else printf '%s' "$STATE_DIR/agent.env"; fi ;;
-    beacon)      printf '%s' "$BEACON_ENV" ;;
     *) die "unknown component: $1" ;;
   esac
 }
 
-unit_name(){ case "$1" in coordinator) echo "$COORD_UNIT";; agent) echo "$AGENT_UNIT";; beacon) echo "$BEACON_UNIT";; esac; }
+unit_name(){ case "$1" in coordinator) echo "$COORD_UNIT";; agent) echo "$AGENT_UNIT";; *) die "unknown component: $1" ;; esac; }
 
-unit_scope(){ case "$1" in beacon) echo user;; *) echo system;; esac; }
-
-unit_file(){ # comp -> unit file path
-  case "$1" in
-    beacon) printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$BEACON_UNIT.service" ;;
-    *)      printf '%s' "/etc/systemd/system/$(unit_name "$1").service" ;;
-  esac
-}
+unit_file(){ printf '%s' "/etc/systemd/system/$(unit_name "$1").service"; }
 
 comp_bin(){ # comp -> best available binary (installed, else freshly built)
   local b
   case "$1" in
     coordinator) b="$COORD_BIN" ;;
     agent)       b="$AGENT_BIN" ;;
-    beacon)      b="$BEACON_BIN" ;;
+    *) die "unknown component: $1" ;;
   esac
   [ -x "$b" ] || b="$DIST/ipcod-$1"
   printf '%s' "$b"
@@ -277,22 +250,25 @@ sys_ctl(){ # scope verb [args...] — scope is system|user
 }
 
 unit_installed(){ [ -f "$(unit_file "$1")" ]; }
-unit_active(){ sys_ctl "$(unit_scope "$1")" is-active --quiet "$(unit_name "$1")" 2>/dev/null; }
+unit_active(){ sys_ctl system is-active --quiet "$(unit_name "$1")" 2>/dev/null; }
 
 dev_pidfile(){ printf '%s' "$STATE_DIR/$1.pid"; }
 dev_pid(){ [ -f "$(dev_pidfile "$1")" ] && cat "$(dev_pidfile "$1")" 2>/dev/null || true; }
 dev_alive(){ local p; p="$(dev_pid "$1")"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
 
 dev_start(){ # comp — background process fallback for non-systemd hosts
-  local c="$1" bin envf
+  local c="$1" bin envf sub=run pargs=() p
   bin="$(comp_bin "$c")"; envf="$(env_file "$c")"
   [ -x "$bin" ] || die "no binary for $c (looked at $bin) — run: ./manage.sh build"
   [ -r "$envf" ] || die "no config for $c at $envf — run: ./manage.sh setup $c"
   dev_alive "$c" && { warn "$c is already running (pid $(dev_pid "$c"))"; return 0; }
+  # Dashboard configured → start as `web -p <port>` instead of headless `run`.
+  p="$(env_get "$envf" IPCOD_WEB_PORT)"
+  if [ -n "$p" ] && [ "$p" != 0 ]; then sub=web; pargs=(-p "$p"); fi
   mkdir -p "$LOG_DIR" "$STATE_DIR"
   # Ignore SIGHUP and detach stdin so the process outlives this terminal.
   # shellcheck disable=SC1090
-  ( trap '' HUP; set -a; . "$envf"; set +a; exec "$bin" run ) \
+  ( trap '' HUP; set -a; . "$envf"; set +a; exec "$bin" "$sub" "${pargs[@]}" ) \
     </dev/null >>"$LOG_DIR/$c.log" 2>&1 &
   echo $! >"$(dev_pidfile "$c")"
   sleep 0.3
@@ -320,7 +296,7 @@ svc_start(){ # comp
   if [ "$(comp_mode "$c")" = systemd ]; then
     unit_installed "$c" || { info "$c isn't installed yet — running setup"; setup_comp "$c"; }
     have_bin "$c" || install_bin "$c"
-    sys_ctl "$(unit_scope "$c")" enable --now "$(unit_name "$c")" >/dev/null 2>&1 || true
+    sys_ctl system enable --now "$(unit_name "$c")" >/dev/null 2>&1 || true
     sleep 0.5
     unit_active "$c" && good "$(unit_name "$c") is active" \
                       || die "$(unit_name "$c") isn't active — check: journalctl -u $(unit_name "$c") -e"
@@ -332,8 +308,8 @@ svc_start(){ # comp
 svc_stop(){ # comp
   local c="$1"
   if [ "$(comp_mode "$c")" = systemd ] && unit_installed "$c"; then
-    info "stopping $(unit_name "$c") (a connected agent can take ~30s to wind down)"
-    sys_ctl "$(unit_scope "$c")" disable --now "$(unit_name "$c")" >/dev/null 2>&1 || true
+    info "stopping $(unit_name "$c") (a cleanly stopped agent drops its ipcod rule; it re-applies on next start)"
+    sys_ctl system disable --now "$(unit_name "$c")" >/dev/null 2>&1 || true
     good "$(unit_name "$c") stopped"
   else
     dev_stop "$c"
@@ -343,8 +319,8 @@ svc_stop(){ # comp
 svc_restart(){ # comp
   local c="$1"
   if [ "$(comp_mode "$c")" = systemd ] && unit_installed "$c"; then
-    info "restarting $(unit_name "$c") (a connected agent can take ~30s to wind down)"
-    sys_ctl "$(unit_scope "$c")" restart "$(unit_name "$c")" >/dev/null 2>&1 \
+    info "restarting $(unit_name "$c") (connected agents reconnect automatically)"
+    sys_ctl system restart "$(unit_name "$c")" >/dev/null 2>&1 \
       || die "restart failed — check: journalctl -u $(unit_name "$c") -e"
     good "$(unit_name "$c") restarted"
   else
@@ -356,7 +332,6 @@ svc_logs(){ # comp [--follow]
   local c="$1" follow="${2:-}"
   if [ "$(comp_mode "$c")" = systemd ] && unit_installed "$c"; then
     local args=(-u "$(unit_name "$c")" -n 200)
-    [ "$(unit_scope "$c")" = user ] && args=(--user "${args[@]}")
     if [ "$follow" = "-f" ] || [ "$follow" = "--follow" ]; then
       journalctl "${args[@]}" -f
     else
@@ -377,7 +352,7 @@ build_binaries(){
   elif command_ok go; then
     mkdir -p "$DIST"
     local t name pkg
-    for t in ipcod-coordinator:coordinator ipcod-agent:agent ipcod-beacon:beacon ipcod:ipcod; do
+    for t in ipcod-coordinator:coordinator ipcod-agent:agent ipcod:ipcod; do
       name="${t%%:*}"; pkg="${t##*:}"
       ( cd "$REPO_DIR" && CGO_ENABLED=0 go build -trimpath -o "$DIST/$name" "./cmd/$pkg" ) || die "build failed for $name"
     done
@@ -388,15 +363,15 @@ build_binaries(){
 }
 
 ensure_bins(){ # build if the dist binaries are missing
-  [ -x "$DIST/ipcod-coordinator" ] && [ -x "$DIST/ipcod-agent" ] && [ -x "$DIST/ipcod-beacon" ] && return 0
+  [ -x "$DIST/ipcod-coordinator" ] && [ -x "$DIST/ipcod-agent" ] && return 0
   build_binaries
 }
 
-install_bin(){ # comp — copy the binary to its system/user location
+install_bin(){ # comp — copy the binary to its system location
   local c="$1" src dst
   case "$c" in
-    beacon) dst="$BEACON_BIN" ;;
-    *)      dst="/usr/local/bin/ipcod-$c" ;;
+    coordinator|agent) dst="/usr/local/bin/ipcod-$c" ;;
+    *) die "unknown component: $c" ;;
   esac
   # Prefer a freshly built dist binary; fall back to what's already installed.
   if [ -x "$DIST/ipcod-$c" ]; then
@@ -407,10 +382,8 @@ install_bin(){ # comp — copy the binary to its system/user location
     ensure_bins; src="$DIST/ipcod-$c"
   fi
   [ "$src" = "$dst" ] && return 0
-  case "$c" in
-    beacon) mkdir -p "$(dirname "$dst")"; install -m 0755 "$src" "$dst" ;;
-    *)      as_root install -d -m 0755 /usr/local/bin; as_root install -m 0755 "$src" "$dst" ;;
-  esac
+  as_root install -d -m 0755 /usr/local/bin
+  as_root install -m 0755 "$src" "$dst"
   good "installed $dst"
 }
 
@@ -423,6 +396,7 @@ url_base(){ # wss://host/ws | https://host/api/beacon | host:port -> base URL
     http://*|https://*) : ;;
     *) u="http://$u" ;;
   esac
+  # tolerate a pasted path (/ws, or the legacy /api/beacon endpoint)
   u="${u%/ws}"; u="${u%/api/beacon}"
   printf '%s' "${u%/}"
 }
@@ -438,7 +412,7 @@ admin_base(){ # where to reach the coordinator's API from here
     printf 'http://127.0.0.1:%s' "$hostport"
     return 0
   fi
-  # no local coordinator config — reuse the agent/beacon-style URL if given
+  # no local coordinator config — reuse the agent-style URL if given
   url_base "${IPCOD_COORDINATOR:-http://127.0.0.1:8443}"
 }
 
@@ -489,28 +463,158 @@ show_token_once(){ # pretty-print a freshly minted token
   printf '  %s%s%s\n\n' "$B" "$1" "$R"
 }
 
+# ---------------------------------------------------------------- web dashboard
+# The coordinator serves the UI only when run as `web` instead of `run`.
+# systemd mode: a unit drop-in swaps ExecStart to `web -p <port>`.
+# dev mode:     IPCOD_WEB_PORT in the dev config; dev_start launches `web -p`.
+
+web_dropin(){ # comp -> systemd drop-in path ("" when the comp has no web mode)
+  case "${1:-coordinator}" in
+    coordinator) printf '%s' "/etc/systemd/system/$COORD_UNIT.service.d/web.conf" ;;
+    *)           printf '' ;;
+  esac
+}
+
+web_port(){ # comp -> dashboard port ("" when the dashboard is off)
+  local c="${1:-coordinator}" f p
+  if [ "$(comp_mode "$c")" = systemd ]; then
+    f="$(web_dropin "$c")"
+    { [ -n "$f" ] && [ -r "$f" ]; } || return 0
+    p="$(sed -n 's/.*-p \([0-9]\{1,\}\).*/\1/p' "$f" | head -n 1)"
+  else
+    p="$(env_get "$(env_file "$c")" IPCOD_WEB_PORT)"
+  fi
+  printf '%s' "$p"
+}
+
+wait_listening(){ # port -> 0 once something HTTP answers on 127.0.0.1:port (~4s max)
+  command_ok curl || return 0
+  local port="$1" i=0 code
+  while [ "$i" -lt 12 ]; do
+    code="$(curl -s -o /dev/null -m 1 -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || true)"
+    case "$code" in ''|000) : ;; *) return 0 ;; esac
+    sleep 0.3
+    i=$((i+1))
+  done
+  return 1
+}
+
+cmd_web(){ # [port|off|on|status] — start/stop the coordinator's web dashboard
+  banner
+  local c=coordinator cur arg port f
+  cur="$(web_port "$c")"
+  arg="${1:-status}"
+  [ "$arg" = on ] && arg="${cur:-8443}"
+
+  case "$arg" in
+    status|"" )
+      if [ -z "$cur" ]; then
+        info "web dashboard: OFF — the coordinator runs headless (agents + API)"
+        info "start it with: ./manage.sh web 8443   (then open http://127.0.0.1:8443/)"
+      else
+        good "web dashboard: ON — http://127.0.0.1:$cur/  (use this host's address remotely)"
+        if command_ok curl; then
+          local code
+          code="$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$cur/" 2>/dev/null || true)"
+          case "$code" in
+            200) ;;
+            000) warn "not answering at http://127.0.0.1:$cur/ — try: ./manage.sh restart coordinator" ;;
+            *)   info "answering (HTTP $code) — a login form is expected without a token" ;;
+          esac
+        fi
+      fi
+      ;;
+    off|0|no|n)
+      if [ -z "$cur" ]; then info "web dashboard is already off"; return 0; fi
+      confirm "Stop serving the web dashboard (the coordinator keeps running)?" y
+      [ "$REPLY" = y ] || { info "aborted"; return 0; }
+      if [ "$(comp_mode "$c")" = systemd ]; then
+        f="$(web_dropin "$c")"
+        if [ -e "$f" ]; then
+          as_root rm -f "$f"
+          as_root rmdir "$(dirname "$f")" 2>/dev/null || true
+        fi
+        as_root systemctl daemon-reload
+      else
+        env_set "$(env_file "$c")" IPCOD_WEB_PORT ""
+      fi
+      svc_restart "$c"
+      good "dashboard off — coordinator is headless again"
+      ;;
+    *)
+      port="$arg"
+      case "$port" in ''|*[!0-9]*) die "port must be a number (got '$port')" ;; esac
+      [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "port must be between 1 and 65535"
+      if [ "$(comp_mode "$c")" = systemd ]; then
+        unit_installed "$c" || { info "coordinator isn't installed yet — running setup"; setup_comp "$c"; }
+        f="$(web_dropin "$c")"
+        as_root mkdir -p "$(dirname "$f")"
+        as_root tee "$f" >/dev/null <<EOF
+# Written by manage.sh: run the coordinator as \`web -p $port\` (dashboard on).
+[Service]
+ExecStart=
+ExecStart=$COORD_BIN web -p $port
+EOF
+        as_root systemctl daemon-reload
+      else
+        [ -r "$(env_file "$c")" ] || { info "coordinator isn't set up yet — running setup"; setup_comp "$c"; }
+        ensure_bins
+        env_set "$(env_file "$c")" IPCOD_WEB_PORT "$port"
+      fi
+      svc_restart "$c"
+      # systemctl restart returns as soon as the process is forked; wait for
+      # the actual bind so the success message (and the next status) is true.
+      if wait_listening "$port"; then
+        good "web dashboard on port $port — open http://127.0.0.1:$port/"
+      else
+        warn "started, but http://127.0.0.1:$port/ hasn't answered yet — check: ./manage.sh logs coordinator"
+      fi
+      ;;
+  esac
+}
+
+web_menu(){ # interactive path behind menu option 14
+  local cur
+  cmd_web status
+  printf '\n'
+  cur="$(web_port coordinator)"
+  if [ -n "$cur" ]; then
+    prompt "New dashboard port (or 'off' to stop serving it)" "$cur"
+  else
+    prompt "Dashboard port to serve on (or 'off' to leave it off)" "8443"
+  fi
+  cmd_web "$REPLY"
+}
+
+
 # ----------------------------------------------------------------------- setup
 setup_coordinator(){
   ensure_bins
   if [ "$(comp_mode coordinator)" = systemd ]; then
-    local was_active=0
-    unit_installed coordinator && unit_active coordinator && was_active=1
     info "launching the coordinator installer (systemd)"
-    local listen cur_token tp
+    local listen cur_token tp wp
     listen="${LISTEN:-$(env_get "$COORD_ENV" IPCOD_LISTEN)}"
     cur_token="${ADMIN_TOKEN:-$(env_get "$COORD_ENV" IPCOD_ADMIN_TOKEN)}"
     tp="${TRUST_PROXY:-}"
     [ -n "$tp" ] || { tp="$(env_get "$COORD_ENV" IPCOD_TRUST_PROXY)"; }
     tp="$(yn "$tp")"
-    as_root env LISTEN="$listen" ADMIN_TOKEN="$cur_token" TRUST_PROXY="$tp" \
-      "$DEPLOY/install-coordinator.sh"
-    if [ "$was_active" = 1 ]; then
-      sys_ctl system restart "$COORD_UNIT" >/dev/null 2>&1 || true
-      good "coordinator restarted with the new config"
+    # Web dashboard: WEB_PORT (env) forces the choice; otherwise leave WEB
+    # unset so the installer asks interactively — or, when scripted, keeps
+    # whatever is currently configured (passed through as WEB_PORT).
+    wp="$(web_port coordinator)"
+    local -a ienv=(LISTEN="$listen" ADMIN_TOKEN="$cur_token" TRUST_PROXY="$tp")
+    if [ -n "${WEB_PORT:-}" ]; then
+      case "$WEB_PORT" in
+        off|0|no|n) ienv+=(WEB=n WEB_PORT=) ;;
+        *)          ienv+=(WEB=y WEB_PORT="$WEB_PORT") ;;
+      esac
+    else
+      ienv+=(WEB_PORT="$wp")
     fi
+    as_root env "${ienv[@]}" "$DEPLOY/install-coordinator.sh"
   else
     info "no systemd here — doing a local (dev) coordinator setup"
-    local listen token tp confirm_gen=n
+    local listen token tp confirm_gen=n wp_cur wp=""
     prompt "Listen address" "${LISTEN:-$(env_get "$(env_file coordinator)" IPCOD_LISTEN)}"
     listen="$REPLY"
     [ -n "$listen" ] || listen=":8443"
@@ -530,6 +634,18 @@ setup_coordinator(){
     confirm "Behind a reverse proxy / tunnel (trust X-Forwarded-For)?" \
       "$([ "${TRUST_PROXY:-0}" = 1 ] && echo y || echo n)"
     [ "$REPLY" = y ] && tp=1 || tp=0
+    # Web dashboard: on or off for this dev coordinator.
+    wp_cur="$(web_port coordinator)"
+    if [ -n "${WEB_PORT:-}" ]; then
+      case "$WEB_PORT" in off|0|no|n) wp="" ;; *) wp="$WEB_PORT" ;; esac
+    else
+      confirm "Serve the web dashboard (admin UI in a browser)?" "$([ -n "$wp_cur" ] && echo y || echo n)"
+      if [ "$REPLY" = y ]; then
+        prompt "Dashboard port" "${wp_cur:-8443}"
+        wp="$REPLY"
+        case "$wp" in ''|*[!0-9]*) die "dashboard port must be a number (got '$wp')" ;; esac
+      fi
+    fi
     mkdir -p "$STATE_DIR"
     local f="$(env_file coordinator)"
     cat >"$f" <<EOF
@@ -537,14 +653,21 @@ setup_coordinator(){
 IPCOD_LISTEN=$listen
 IPCOD_ADMIN_TOKEN=$token
 IPCOD_TRUST_PROXY=$tp
+# Dashboard port: empty = headless ("run" mode); set = web -p <port>.
+IPCOD_WEB_PORT=$wp
+# Keep the dev DB out of the repo working tree.
+IPCOD_DB=$STATE_DIR/ipcod.db
 EOF
     chmod 0600 "$f"
     good "wrote $f"
     install_bin coordinator
     dev_start coordinator
   fi
-  printf '\n  Next: open the dashboard, sign in with the admin token, and create\n'
-  printf '  an agent + a beacon — or use %s./manage.sh create-agent <name> <port>%s.\n\n' "$DIM" "$R"
+  printf '\n  Next: the dashboard is served on demand — %s./manage.sh web 8443%s —\n' "$DIM" "$R"
+  printf '  sign in with the admin token, and create an agent with\n'
+  printf '  %s./manage.sh create-agent <name> <port>%s.\n' "$DIM" "$R"
+  printf '  The coordinator detects the public IP by itself; agents only need\n'
+  printf '  %swss://<your-host>/ws%s.\n\n' "$DIM" "$R"
 }
 
 setup_agent(){
@@ -579,7 +702,7 @@ setup_agent(){
     token="$REPLY"
     [ -n "$token" ] || die "agent token is required — create an agent in the dashboard first"
     case "$token" in
-      ipcb_*) die "that is an ipcb_ BEACON token — the agent needs an ipca_ token (create one in the dashboard)" ;;
+      ipcb_*) die "that's a legacy ipcb_ beacon token — agents need an ipca_ token (create one with ./manage.sh create-agent)" ;;
     esac
     prompt "Display name" "${NAME:-$(env_get "$(env_file agent)" IPCOD_NAME)}"
     name="$REPLY"
@@ -606,86 +729,7 @@ EOF
   fi
 }
 
-setup_beacon(){
-  ensure_bins
-  local coord token interval
-  prompt "Coordinator beacon endpoint (host is fine)" \
-    "${COORD:-$(env_get "$BEACON_ENV" IPCOD_COORDINATOR)}"
-  coord="$(normalize_beacon "$REPLY")"
-  [ "$coord" != "https:///api/beacon" ] || die "coordinator endpoint is required"
-  prompt "Beacon token (${B}ipcb_…${R}, from the dashboard)" \
-    "${TOKEN:-$(env_get "$BEACON_ENV" IPCOD_TOKEN)}"
-  token="$REPLY"
-  [ -n "$token" ] || die "beacon token is required — create a beacon in the dashboard first"
-  case "$token" in
-    ipca_*) die "that is an ipca_ AGENT token — the beacon needs an ipcb_ token (create one in the dashboard)" ;;
-  esac
-  prompt "Check-in interval" "${INTERVAL:-$(env_get "$BEACON_ENV" IPCOD_BEACON_INTERVAL)}"
-  interval="$REPLY"
-  [ -n "$interval" ] || interval=30s
-
-  if is_root; then
-    warn "the beacon normally runs as YOUR login user, not root — this installs it for root"
-  fi
-
-  mkdir -p "$(dirname "$BEACON_ENV")"
-  cat >"$BEACON_ENV" <<EOF
-# ipcod beacon config (written by manage.sh)
-IPCOD_COORDINATOR=$coord
-IPCOD_TOKEN=$token
-# Read by manage.sh only; the interval is passed on the ExecStart line.
-IPCOD_BEACON_INTERVAL=$interval
-EOF
-  chmod 0600 "$BEACON_ENV"
-  good "wrote $BEACON_ENV"
-  install_bin beacon
-
-  if [ "$(comp_mode beacon)" = systemd ]; then
-    mkdir -p "$(dirname "$(unit_file beacon)")"
-    local exec_start="$BEACON_BIN run"
-    [ "$interval" != 30s ] && exec_start="$exec_start -interval $interval"
-    cat >"$(unit_file beacon)" <<EOF
-[Unit]
-Description=ipcod beacon (reports laptop public IP to coordinator)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-EnvironmentFile=$BEACON_ENV
-ExecStart=$exec_start
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-EOF
-    systemctl --user daemon-reload
-    if unit_active beacon; then
-      systemctl --user restart "$BEACON_UNIT" >/dev/null 2>&1 || true   # pick up new env/token
-    else
-      systemctl --user enable --now "$BEACON_UNIT" >/dev/null 2>&1 || true
-    fi
-    sleep 0.5
-    unit_active beacon && good "$BEACON_UNIT (user unit) is active" \
-                        || warn "beacon isn't active yet — check: journalctl --user -u $BEACON_UNIT -e"
-    confirm "Enable lingering so the beacon runs while logged out?" y
-    if [ "$REPLY" = y ]; then
-      if command_ok loginctl; then
-        loginctl enable-linger "${SUDO_USER:-$USER}" 2>/dev/null \
-          && good "lingering enabled for ${SUDO_USER:-$USER}" \
-          || warn "could not enable linger (needs root or lingering already managed)"
-      else
-        warn "loginctl not found — skipping linger"
-      fi
-    fi
-  else
-    dev_start beacon
-  fi
-  printf '\n  Verify with: %s./manage.sh health%s\n\n' "$DIM" "$R"
-}
-
-setup_comp(){ case "$1" in coordinator) setup_coordinator;; agent) setup_agent;; beacon) setup_beacon;; esac; }
+setup_comp(){ case "$1" in coordinator) setup_coordinator;; agent) setup_agent;; *) die "unknown component: $1" ;; esac; }
 
 # --------------------------------------------------------------------- health
 health_coordinator(){
@@ -706,6 +750,19 @@ health_coordinator(){
   esac
 }
 
+health_web(){ # probe the dashboard when it's enabled
+  local p code
+  p="$(web_port coordinator)"
+  [ -n "$p" ] || return 0
+  command_ok curl || { warn "curl missing — cannot probe the dashboard on :$p"; return 0; }
+  code="$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$p/" 2>/dev/null || true)"
+  case "$code" in
+    200) good "web dashboard OK (http://127.0.0.1:$p/)" ;;
+    000) warn "web dashboard enabled but not answering at http://127.0.0.1:$p/" ;;
+    *)   good "web dashboard answering on :$p (HTTP $code)" ;;
+  esac
+}
+
 health_agent(){
   local bin f coord token
   bin="$(comp_bin agent)"
@@ -723,32 +780,24 @@ health_agent(){
   fi
 }
 
-health_beacon(){
-  local bin f coord token
-  bin="$(comp_bin beacon)"
-  [ -x "$bin" ] || { warn "beacon binary not found"; return 0; }
-  f="$(env_file beacon)"
-  coord="$(env_get "$f" IPCOD_COORDINATOR)"; token="$(env_get "$f" IPCOD_TOKEN)"
-  if [ -z "$coord" ] || [ -z "$token" ]; then
-    warn "beacon not configured (no coordinator/token in $f)"
-    return 0
-  fi
-  local out
-  if out="$("$bin" once -coordinator "$coord" -token "$token" 2>&1)"; then
-    good "beacon once OK — $out"
-  else
-    warn "beacon once failed — $out"
-  fi
-}
-
 cmd_health(){
   banner
   printf '%s── Health checks%s\n' "$B" "$R"
   health_coordinator
+  health_web
   health_agent
-  health_beacon
   if [ -r "$(env_file coordinator)" ] && [ -n "$(admin_token)" ] && command_ok curl; then
-    admin_req GET /api/admin/status | json_pp || true
+    local st ip
+    st="$(admin_req GET /api/admin/status 2>/dev/null || true)"
+    if [ -n "$st" ]; then
+      printf '%s' "$st" | json_pp || true
+      ip="$(printf '%s' "$st" | json_str ip)"
+      if [ -n "$ip" ]; then
+        good "public IP known: $ip"
+      else
+        warn "no public IP yet — detection is starting, or IPCOD_NO_DETECT=1 / -no-detect is set"
+      fi
+    fi
   fi
   printf '\n'
 }
@@ -776,6 +825,11 @@ cmd_status(){
   for c in $COMPONENTS; do
     printf '  %-12s %s\n' "$c" "$(comp_state "$c")"
   done
+  local wp
+  wp="$(web_port coordinator)"
+  if [ -n "$wp" ]; then
+    printf '  %-12s %s\n' "web ui" "http://127.0.0.1:$wp/"
+  fi
 
   if [ -n "$(admin_token)" ] && command_ok curl; then
     printf '\n%s── Coordinator%s\n' "$B" "$R"
@@ -799,25 +853,18 @@ cmd_status(){
   printf '\n'
 }
 
-# ------------------------------------------------------- agents & beacons CRUD
-list_kind(){ # agent|beacon
-  local kind="$1" path items
-  case "$kind" in
-    agent)  path=/api/admin/agents;  items=.agents  ;;
-    beacon) path=/api/admin/beacons; items=.beacons ;;
-    *) die "unknown kind: $kind" ;;
-  esac
+# ---------------------------------------------------------------- agents CRUD
+list_agents(){
   local body
-  body="$(admin_req GET "$path")"
+  body="$(admin_req GET /api/admin/agents)"
   if have_jq; then
     printf '%s' "$body" | jq -r \
-      "$items[] | \"  \(.id)  \(.name)  port=\(.port // \"-\")  enabled=\(.enabled)  last_ip=\(.last_ip // \"-\")  seen=\(.last_seen // \"-\")\""
+      '.agents[] | "  \(.id)  \(.name)  port=\(.port // "-")  enabled=\(.enabled)  last_ip=\(.last_ip // "-")  seen=\(.last_seen // "-")"'
   elif have_py; then
     printf '%s' "$body" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
-items = d.get("agents") or d.get("beacons") or []
-for it in items:
+for it in d.get("agents") or []:
     extra = "port=%s " % it["port"] if "port" in it else ""
     print("  %s  %s  %senabled=%s  last_ip=%s  seen=%s" % (
         it.get("id",""), it.get("name",""), extra, it.get("enabled",""),
@@ -831,33 +878,33 @@ cmd_list(){ # [quiet]
   local quiet="${1:-}"
   if [ "$quiet" != quiet ]; then banner; printf '%s── Agents%s\n' "$B" "$R"; fi
   api_ready || return 0
-  list_kind agent || true
+  list_agents || true
   [ "$quiet" = quiet ] && return 0
-  printf '\n%s── Beacons%s\n' "$B" "$R"
-  list_kind beacon || true
   printf '\n'
 }
 
-find_id_by_name(){ # kind name -> id ("" if not found)
-  local kind="$1" name="$2" path body
-  case "$kind" in agent) path=/api/admin/agents;; beacon) path=/api/admin/beacons;; esac
-  body="$(admin_req GET "$path")"
+find_agent_id(){ # name -> id ("" if not found)
+  local name="$1" body
+  body="$(admin_req GET /api/admin/agents)"
   if have_jq; then
     printf '%s' "$body" | jq -r --arg n "$name" \
-      '(.agents // .beacons)[] | select(.name == $n) | .id' | head -n 1
+      '.agents[] | select(.name == $n) | .id' | head -n 1
   elif have_py; then
     printf '%s' "$body" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
-for it in (d.get("agents") or d.get("beacons") or []):
+for it in d.get("agents") or []:
     if it.get("name") == sys.argv[1]:
         print(it.get("id","")); break' "$name"
   fi
 }
 
-resolve_id(){ # kind name-or-id -> id
-  local kind="$1" ref="$2" id
-  id="$(find_id_by_name "$kind" "$ref")"
+resolve_id(){ # name-or-id -> id
+  local ref="$1" id
+  case "$ref" in
+    beacon|beacons) die "the beacon is gone — the coordinator detects this machine's public IP itself" ;;
+  esac
+  id="$(find_agent_id "$ref")"
   [ -n "$id" ] && printf '%s' "$id" || printf '%s' "$ref"
 }
 
@@ -880,64 +927,54 @@ cmd_create_agent(){ # name port [proto]
   printf '    %ssudo COORD=wss://<your-coordinator>/ws TOKEN=%s ./deploy/install-agent.sh%s\n\n' "$DIM" "$tok" "$R"
 }
 
-cmd_create_beacon(){ # [name]
+cmd_rotate(){ # [agent name-or-id]
   banner
-  local name="${1:-}"
-  [ -n "$name" ] || { prompt "Beacon name (e.g. laptop)"; name="$REPLY"; }
-  local out tok
-  out="$(admin_req POST /api/admin/beacons "{\"name\":\"$(json_escape "$name")\"}")"
-  tok="$(printf '%s' "$out" | json_str token)"
-  good "beacon '$name' created"
-  show_token_once "$tok"
-  printf '  Use it on your laptop:\n'
-  printf '    %s./manage.sh setup beacon%s   (paste the token when asked)\n\n' "$DIM" "$R"
-}
-
-cmd_rotate(){ # agent|beacon name-or-id
-  banner
-  local kind="$1" ref="${2:-}" id out tok
-  [ -n "$ref" ] || { list_kind "$kind"; prompt "Which $kind (name or id)"; ref="$REPLY"; }
-  id="$(resolve_id "$kind" "$ref")"
-  confirm "Rotate the token for $kind '$ref'? The old token stops working immediately." n
+  local ref="${1:-}" id out tok
+  [ -n "$ref" ] || { list_agents; prompt "Which agent (name or id)"; ref="$REPLY"; }
+  [ -n "$ref" ] || die "an agent name or id is required"
+  id="$(resolve_id "$ref")"
+  confirm "Rotate the token for agent '$ref'? The old token stops working immediately." n
   [ "$REPLY" = y ] || { info "aborted"; return 0; }
-  out="$(admin_req POST "/api/admin/${kind}s/$id/rotate")"
+  out="$(admin_req POST "/api/admin/agents/$id/rotate")"
   tok="$(printf '%s' "$out" | json_str token)"
   good "token rotated"
   show_token_once "$tok"
   # Keep the local service config in sync when we own it here.
   local f
-  f="$(env_file "$kind")"
+  f="$(env_file agent)"
   if [ -r "$f" ] && grep -q '^IPCOD_TOKEN=' "$f" 2>/dev/null; then
-    confirm "Write the new token to $f and restart $kind?" y
+    confirm "Write the new token to $f and restart the agent?" y
     if [ "$REPLY" = y ]; then
       env_set "$f" IPCOD_TOKEN "$tok"
       good "updated $f"
-      svc_restart "$kind"
+      svc_restart agent
       return 0
     fi
   fi
-  printf '  Update the %s config with the new token, then restart it.\n\n' "$kind"
+  printf '  Update the agent config with the new token, then restart it.\n\n'
 }
 
-cmd_toggle(){ # agent|beacon name-or-id on|off
-  local kind="$1" ref="$2" state="$3" id enabled
+cmd_toggle(){ # on|off <agent name-or-id>
+  local state="$1" ref="${2:-}" id enabled
   banner
-  [ -n "$ref" ] || { list_kind "$kind"; prompt "Which $kind (name or id)"; ref="$REPLY"; }
+  [ -n "$ref" ] || { list_agents; prompt "Which agent (name or id)"; ref="$REPLY"; }
+  [ -n "$ref" ] || die "an agent name or id is required"
   [ "$state" = on ] && enabled=true || enabled=false
-  id="$(resolve_id "$kind" "$ref")"
-  admin_req PATCH "/api/admin/${kind}s/$id" "{\"enabled\":$enabled}" >/dev/null
-  good "$kind '$ref' is now $state"
+  id="$(resolve_id "$ref")"
+  admin_req PATCH "/api/admin/agents/$id" "{\"enabled\":$enabled}" >/dev/null
+  good "agent '$ref' is now $state"
 }
 
-cmd_delete(){ # agent|beacon name-or-id
-  local kind="$1" ref="${2:-}" id
+cmd_delete(){ # [agent name-or-id]
+  local ref="${1:-}" id
   banner
-  [ -n "$ref" ] || { list_kind "$kind"; prompt "Which $kind (name or id)"; ref="$REPLY"; }
-  confirm "Delete $kind '$ref' and revoke its token? This cannot be undone." n
+  [ -n "$ref" ] || { list_agents; prompt "Which agent (name or id)"; ref="$REPLY"; }
+  [ -n "$ref" ] || die "an agent name or id is required"
+  confirm "Delete agent '$ref' and revoke its token? This cannot be undone." n
   [ "$REPLY" = y ] || { info "aborted"; return 0; }
-  id="$(resolve_id "$kind" "$ref")"
-  admin_req DELETE "/api/admin/${kind}s/$id" >/dev/null
-  good "$kind '$ref' deleted"
+  id="$(resolve_id "$ref")"
+  admin_req DELETE "/api/admin/agents/$id" >/dev/null
+  good "agent '$ref' deleted"
 }
 
 # ------------------------------------------------------------------- IP tools
@@ -949,7 +986,7 @@ cmd_ip(){ # [new-ip]
     case "$new" in
       *[!0-9a-fA-F:.]*) die "'$new' doesn't look like an IPv4/IPv6 address" ;;
     esac
-    confirm "Force the laptop IP to $new (overrides beacon detection until it changes)?" n
+    confirm "Force the laptop IP to $new (overrides automatic detection until the IP next changes)?" n
     [ "$REPLY" = y ] || { info "aborted"; return 0; }
     admin_req POST /api/admin/ip "{\"ip\":\"$new\"}" >/dev/null
     good "IP forced to $new — pushed to every connected agent"
@@ -1024,21 +1061,22 @@ uninstall_comp(){
   # Stop in whichever mode it runs; also sweep a leftover unit from the other
   # mode so a previous install never lingers behind.
   if [ "$(comp_mode "$c")" = systemd ] && unit_installed "$c"; then
-    sys_ctl "$(unit_scope "$c")" disable --now "$(unit_name "$c")" >/dev/null 2>&1 || true
+    sys_ctl system disable --now "$(unit_name "$c")" >/dev/null 2>&1 || true
     good "stopped $(unit_name "$c")"
   else
     dev_stop "$c"
-    unit_installed "$c" && sys_ctl "$(unit_scope "$c")" disable --now "$(unit_name "$c")" >/dev/null 2>&1 || true
+    unit_installed "$c" && sys_ctl system disable --now "$(unit_name "$c")" >/dev/null 2>&1 || true
   fi
   if unit_installed "$c"; then
     as_root rm -f "$(unit_file "$c")"
-    if [ "$(unit_scope "$c")" = user ]; then
-      systemctl --user daemon-reload 2>/dev/null || true
-      systemctl --user reset-failed "$(unit_name "$c")" 2>/dev/null || true
-    else
-      as_root systemctl daemon-reload
-      as_root systemctl reset-failed "$(unit_name "$c")" 2>/dev/null || true
+    local wd
+    wd="$(web_dropin "$c")"
+    if [ -n "$wd" ]; then
+      as_root rm -f "$wd"
+      as_root rmdir "$(dirname "$wd")" 2>/dev/null || true
     fi
+    as_root systemctl daemon-reload
+    as_root systemctl reset-failed "$(unit_name "$c")" 2>/dev/null || true
     good "removed unit $(unit_name "$c")"
   fi
   local f="$(env_file "$c")"
@@ -1046,38 +1084,55 @@ uninstall_comp(){
     if [ -w "$f" ]; then rm -f "$f"; else as_root rm -f "$f"; fi
     good "removed config $f"
   fi
+  # Sweep the other mode's config too (a dev uninstall must not leave the
+  # systemd env behind, or vice versa), including installer .bak backups.
+  local sysf devf
+  sysf="$COORD_ENV"; [ "$c" = agent ] && sysf="$AGENT_ENV"
+  devf="$STATE_DIR/$c.env"
+  if [ "$f" != "$sysf" ] && [ -e "$sysf" ]; then
+    as_root rm -f "$sysf" "$sysf".bak.*
+    good "removed config $sysf"
+  fi
+  if [ "$f" != "$devf" ] && [ -e "$devf" ]; then
+    rm -f "$devf" "$devf".bak.*
+    good "removed config $devf"
+  fi
   case "$c" in
-    beacon) rm -f "$BEACON_BIN" ;;
-    *)      as_root rm -f "/usr/local/bin/ipcod-$c" ;;
+    coordinator|agent) as_root rm -f "/usr/local/bin/ipcod-$c" ;;
+    *) die "unknown component: $c" ;;
   esac
   good "removed binary"
   if [ "$c" = coordinator ]; then
-    confirm "Also delete the database (agents, beacons, IP history)?" n
+    confirm "Also delete the database (agents, IP history)?" n
     if [ "$REPLY" = y ]; then
       # /var/lib/ipcod is a symlink into systemd's private dir when the unit
-      # owns it; remove both so no stale DB survives a purge.
+      # owns it; remove both so no stale DB survives a purge. Dev mode keeps
+      # its DB (plus -wal/-shm) under the state dir.
       as_root rm -rf /var/lib/ipcod /var/lib/private/ipcod
-      good "removed the coordinator database (/var/lib/ipcod)"
+      rm -f "$STATE_DIR/ipcod.db" "$STATE_DIR"/ipcod.db-* 2>/dev/null || true
+      good "removed the coordinator database"
     fi
   fi
   rm -f "$STATE_DIR/$c.pid"
+  # If that emptied the config dir, take it too (fails harmlessly if non-empty).
+  as_root rmdir /etc/ipcod 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------- menu
 menu_loop(){
   while true; do
     banner
-    printf '  %scoordinator%s %s | %sagent%s %s | %sbeacon%s %s\n\n' \
+    printf '  %scoordinator%s %s | %sagent%s %s\n\n' \
       "$B" "$R" "$(comp_state coordinator)" \
-      "$B" "$R" "$(comp_state agent)" \
-      "$B" "$R" "$(comp_state beacon)"
-    printf '   %s1)%s Status overview          %s8)%s Agents & beacons (list/create)\n' "$DIM" "$R" "$DIM" "$R"
-    printf '   %s2)%s Setup / install          %s9)%s Rotate a token\n' "$DIM" "$R" "$DIM" "$R"
+      "$B" "$R" "$(comp_state agent)"
+    printf '   %s1)%s Status overview          %s8)%s Agents (list/create)\n' "$DIM" "$R" "$DIM" "$R"
+    printf '   %s2)%s Setup / install          %s9)%s Rotate agent token\n' "$DIM" "$R" "$DIM" "$R"
     printf '   %s3)%s Start                     %s10)%s Force laptop IP\n' "$DIM" "$R" "$DIM" "$R"
     printf '   %s4)%s Stop                      %s11)%s Build binaries\n' "$DIM" "$R" "$DIM" "$R"
     printf '   %s5)%s Restart                   %s12)%s Agent dry-run on/off\n' "$DIM" "$R" "$DIM" "$R"
     printf '   %s6)%s Logs                      %s13)%s Uninstall\n' "$DIM" "$R" "$DIM" "$R"
-    printf '   %s7)%s Health checks             %s0)%s Quit\n\n' "$DIM" "$R" "$DIM" "$R"
+    printf '   %s7)%s Health checks             %s14)%s Web dashboard on/off\n' "$DIM" "$R" "$DIM" "$R"
+    printf '   %s0)%s Quit\n\n' "$DIM" "$R"
     printf 'Choice: '
     local choice c
     IFS= read -r choice || choice=0
@@ -1091,11 +1146,12 @@ menu_loop(){
       6)  ( banner; pick_comp; svc_logs "$REPLY" -f ) || true ;;
       7)  ( cmd_health ) || true ;;
       8)  ( agents_menu ) || true ;;
-      9)  ( banner; printf 'Rotate token for:\n'; pick_comp; cmd_rotate "$REPLY" ) || true ;;
+      9)  ( cmd_rotate ) || true ;;
       10) ( banner; prompt "New laptop IP (empty to just show current)" ""; cmd_ip "$REPLY" ) || true ;;
       11) ( build_binaries ) || true ;;
       12) ( banner; cmd_dryrun ) || true ;;
       13) ( banner; pick_comp; uninstall_comp "$REPLY" ) || true ;;
+      14) ( web_menu ) || true ;;
       0|q|Q|"") return 0 ;;
       *) printf '%s\n' "  unknown choice" ;;
     esac
@@ -1109,26 +1165,21 @@ agents_menu(){
   while true; do
     banner
     api_ready || return 0
-    printf '  %sAgents%s\n' "$B" "$R"; list_kind agent || true
-    printf '\n  %sBeacons%s\n' "$B" "$R"; list_kind beacon || true
-    printf '\n   %s1)%s Create agent      %s5)%s Disable agent/beacon\n' "$DIM" "$R" "$DIM" "$R"
-    printf '   %s2)%s Create beacon     %s6)%s Enable agent/beacon\n' "$DIM" "$R" "$DIM" "$R"
-    printf '   %s3)%s Rotate token      %s7)%s Delete agent/beacon\n' "$DIM" "$R" "$DIM" "$R"
-    printf '   %s4)%s Refresh           %s0)%s Back\n\n' "$DIM" "$R" "$DIM" "$R"
+    printf '  %sAgents%s\n' "$B" "$R"; list_agents || true
+    printf '\n   %s1)%s Create agent        %s4)%s Disable agent\n' "$DIM" "$R" "$DIM" "$R"
+    printf '   %s2)%s Rotate token        %s5)%s Enable agent\n' "$DIM" "$R" "$DIM" "$R"
+    printf '   %s3)%s Delete agent        %s6)%s Refresh\n' "$DIM" "$R" "$DIM" "$R"
+    printf '   %s0)%s Back\n\n' "$DIM" "$R"
     printf 'Choice: '
-    local choice kind ref
+    local choice
     IFS= read -r choice || choice=0
     case "$choice" in
       1) ( cmd_create_agent ) || true ;;
-      2) ( cmd_create_beacon ) || true ;;
-      3) ( banner; printf 'Which kind?\n'; pick_comp; cmd_rotate "$REPLY" ) || true ;;
-      4) : ;;
-      5|6)
-        ( banner; printf 'Which kind?\n'; pick_comp; kind="$REPLY"
-          prompt "Name or id of the $kind" ""; ref="$REPLY"
-          if [ "$choice" = 5 ]; then cmd_toggle "$kind" "$ref" off
-          else cmd_toggle "$kind" "$ref" on; fi ) || true ;;
-      7) ( banner; printf 'Which kind?\n'; pick_comp; cmd_delete "$REPLY" ) || true ;;
+      2) ( cmd_rotate ) || true ;;
+      3) ( cmd_delete ) || true ;;
+      4) ( cmd_toggle off ) || true ;;
+      5) ( cmd_toggle on ) || true ;;
+      6) : ;;
       0|q|Q|"") return 0 ;;
       *) printf '%s\n' "  unknown choice" ;;
     esac
@@ -1140,7 +1191,7 @@ agents_menu(){
 # ---------------------------------------------------------------------- help
 usage(){
   cat <<EOF
-${B}ipcod manage.sh${R} — set up and operate the coordinator, agent and beacon.
+${B}ipcod manage.sh${R} — set up and operate the coordinator and agent.
 
 ${B}Usage${R}
   ./manage.sh                     interactive menu
@@ -1149,11 +1200,11 @@ ${B}Usage${R}
 ${B}Env${R}
   IPCOD_URL=http://host:port       base URL for admin API calls (default: local coordinator)
   IPCOD_ADMIN_TOKEN=token          admin token when the local env file isn't readable
-  IPCOD_COORDINATOR=url            derive the API base URL from a ws/beacon URL
+  IPCOD_COORDINATOR=url            derive the API base URL from a ws URL
   IPCOD_YES=1                      same as -y
   IPCOD_DEV=1                      force plain background processes (skip systemd)
   IPCOD_STATE_DIR=path             dev-mode state dir (default ~/.local/state/ipcod)
-  COORD/TOKEN/NAME/DRY_RUN/INTERVAL   non-interactive setup defaults
+  COORD/TOKEN/NAME/DRY_RUN/WEB_PORT   non-interactive setup defaults
 
 ${B}Commands${R}
   status                          services + coordinator summary
@@ -1161,14 +1212,14 @@ ${B}Commands${R}
   start|stop|restart <comp>       control a component
   logs       <comp> [-f]          tail logs (journalctl or dev log)
   config     <comp> [show|edit]   view or edit a component's config
-  health                          run health checks (healthz, agent check, beacon once)
+  health                          run health checks (healthz, agent check, public IP)
   build                           build the binaries into dist/
-  list                            list agents + beacons (admin API)
+  list                            list registered agents (admin API)
   create-agent <name> <port> [proto]   create an agent, print its token once
-  create-beacon <name>            create a beacon, print its token once
-  rotate      <comp> [name|id]    rotate a token
-  enable|disable <comp> <name|id> toggle an agent/beacon
-  delete      <comp> <name|id>    delete an agent/beacon
+  rotate      [name|id]           rotate an agent token
+  enable|disable <name|id>        toggle an agent
+  delete      <name|id>           delete an agent
+  web         [port|off|on|status]  web dashboard, e.g. web 8443 / web off
   ip          [addr]              show the laptop IP, or force-set it
   token       admin               generate a new admin token
   dry-run     on|off              toggle the agent's ufw dry-run mode
@@ -1177,11 +1228,12 @@ ${B}Commands${R}
   help                            this text
 
 ${B}Components${R}
-  coordinator | agent | beacon     (abbreviations c / a / b work too)
+  coordinator | agent             (abbreviations c / a work too)
 
 ${B}Examples${R}
   ./manage.sh                                  # menu
-  sudo ./manage.sh setup coordinator           # then setup agent / beacon
+  sudo ./manage.sh setup coordinator           # then setup agent
+  ./manage.sh web 8443                         # dashboard at http://127.0.0.1:8443/
   ./manage.sh create-agent web-1 22
   ./manage.sh logs agent -f
   ./manage.sh dry-run off                      # go live with real ufw changes
@@ -1189,10 +1241,16 @@ EOF
 }
 
 cmd_version(){
-  local b
-  for b in ipcod-coordinator ipcod-agent ipcod-beacon; do
-    if [ -x "$(comp_bin "${b#ipcod-}")" ]; then
-      printf '  %-18s %s\n' "$b" "$("$(comp_bin "${b#ipcod-}")" version 2>/dev/null | head -n 1)"
+  local b bin
+  for b in ipcod-coordinator ipcod-agent ipcod; do
+    if [ "$b" = ipcod ]; then
+      # the unified bundle only exists in dist/ (never installed to a system path)
+      bin="$DIST/ipcod"
+    else
+      bin="$(comp_bin "${b#ipcod-}")"
+    fi
+    if [ -x "$bin" ]; then
+      printf '  %-18s %s\n' "$b" "$("$bin" version 2>/dev/null | head -n 1)"
     else
       printf '  %-18s %s(not installed)%s\n' "$b" "$DIM" "$R"
     fi
@@ -1222,11 +1280,12 @@ main(){
     build)               build_binaries ;;
     list|ls)             cmd_list ;;
     create-agent)        cmd_create_agent "${1:-}" "${2:-}" "${3:-}" ;;
-    create-beacon)       cmd_create_beacon "${1:-}" ;;
-    rotate)              pick_comp "${1:-}"; cmd_rotate "$REPLY" "${2:-}" ;;
-    enable)              pick_comp "${1:-}"; cmd_toggle "$REPLY" "${2:-}" on ;;
-    disable)             pick_comp "${1:-}"; cmd_toggle "$REPLY" "${2:-}" off ;;
-    delete)              pick_comp "${1:-}"; cmd_delete "$REPLY" "${2:-}" ;;
+    create-beacon)       die "the beacon is gone — the coordinator detects this machine's public IP itself" ;;
+    web)                 cmd_web "${1:-}" ;;
+    rotate)              case "${1:-}" in agent|a) shift ;; esac; cmd_rotate "${1:-}" ;;
+    enable)              case "${1:-}" in agent|a) shift ;; esac; cmd_toggle on "${1:-}" ;;
+    disable)             case "${1:-}" in agent|a) shift ;; esac; cmd_toggle off "${1:-}" ;;
+    delete)              case "${1:-}" in agent|a) shift ;; esac; cmd_delete "${1:-}" ;;
     ip)                  cmd_ip "${1:-}" ;;
     token)               cmd_token "${1:-}" ;;
     dry-run|dryrun)      cmd_dryrun "${1:-}" ;;

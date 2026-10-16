@@ -9,15 +9,14 @@ import (
 // It defaults to "dev" for local builds.
 var Version = "dev"
 
-// Root builds the unified `ipcod` command tree, exposing the coordinator,
-// agent, and beacon as subcommands alongside version/help.
+// Root builds the unified `ipcod` command tree, exposing the coordinator and
+// agent as subcommands alongside version/help.
 //
 // The same tree is what backs the individual binaries; they simply set their
 // own root to one of the sub-commands (see cmd/*/main.go).
 func Root() *Command {
 	coord := Coordinator()
 	agent := Agent()
-	beacon := Beacon()
 
 	// Nesting under the unified binary: require an explicit subcommand instead
 	// of silently defaulting to `run`, so `ipcod` alone prints help.
@@ -27,21 +26,21 @@ func Root() *Command {
 	agent.DefaultDisabled = true
 	agent.Run = nil
 	agent.flagSetup = nil
-	beacon.DefaultDisabled = true
-	beacon.Run = nil
-	beacon.flagSetup = nil
 
 	return &Command{
 		Name:  "ipcod",
 		Short: "Dynamic IP allowlisting for your VPSes",
-		Long: `ipcod keeps a set of VPS firewalls (via ufw) in sync with your laptop's
-current public IP. A central coordinator tracks your IP via a laptop beacon
-and pushes changes to agents running on each VPS.`,
+		Long: `ipcod keeps a set of VPS firewalls (via ufw) in sync with your
+current public IP.
+
+There are two pieces:
+  coordinator   run it on your laptop — it detects your public IP itself,
+                agents dial in and get pushed changes
+  agent         run it on each VPS — it applies the IP via ufw`,
 		DefaultDisabled: true,
 		Sub: []*Command{
 			coord,
 			agent,
-			beacon,
 			versionCmd(),
 		},
 	}

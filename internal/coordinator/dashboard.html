@@ -55,7 +55,7 @@
   </header>
   <main>
     <div class="card">
-      <h2>Current laptop IP</h2>
+      <h2>Current public IP</h2>
       <div class="row">
         <div class="stat"><div class="k">IP</div><div class="v" id="ip">—</div></div>
         <div class="stat"><div class="k">Revision</div><div class="v" id="rev">—</div></div>
@@ -82,11 +82,14 @@
     </div>
 
     <div class="card">
-      <h2>Beacons (laptops)</h2>
+      <h2>Beacon override (legacy)</h2>
+      <p class="muted" style="margin:4px 0 12px">The coordinator detects this machine's public IP
+        itself, so you normally need nothing here. Add a beacon only if you run an older
+        <code>ipcod-beacon</code> binary somewhere and want its check-ins to set the IP instead.</p>
       <table><thead><tr><th>Name</th><th>Status</th><th>Last IP</th><th>Last seen</th><th></th></tr></thead>
       <tbody id="beacons"></tbody></table>
       <div style="margin-top:16px" class="form-grid">
-        <div><label>Name</label><input id="bName" placeholder="my-laptop"></div>
+        <div><label>Name</label><input id="bName" placeholder="legacy-beacon"></div>
         <div style="grid-column:span 3"><button onclick="createBeacon()">Add beacon</button></div>
       </div>
       <div class="token" id="beaconTokenBox" style="display:none; margin-top:12px"></div>
@@ -94,7 +97,7 @@
 
     <div class="card">
       <h2>Recent IP history</h2>
-      <table><thead><tr><th>IP</th><th>Beacon</th><th>When</th></tr></thead>
+      <table><thead><tr><th>IP</th><th>Source</th><th>When</th></tr></thead>
       <tbody id="history"></tbody></table>
     </div>
   </main>
@@ -168,13 +171,13 @@ async function refresh(){
       <td>
         <button class="ghost" onclick="rotateBeacon('${b.id}')">Rotate token</button>
         <button class="danger" onclick="delBeacon('${b.id}')">Delete</button>
-      </td></tr>`).join('') || '<tr><td colspan=5 class=muted>No beacons yet.</td></tr>';
+      </td></tr>`).join('') || '<tr><td colspan=5 class=muted>No legacy beacons.</td></tr>';
   } catch(e){}
 
   try {
     const {history} = await api('/api/admin/ip-history?limit=15');
     document.getElementById('history').innerHTML = history.map(h => `<tr>
-      <td>${esc(h.ip)}</td><td>${esc(h.beacon_id)}</td><td>${esc(h.changed_at)}</td></tr>`).join('')
+      <td>${esc(h.ip)}</td><td>${h.beacon_id==='auto'?'detected':esc(h.beacon_id)}</td><td>${esc(h.changed_at)}</td></tr>`).join('')
       || '<tr><td colspan=3 class=muted>No history yet.</td></tr>';
   } catch(e){}
 }

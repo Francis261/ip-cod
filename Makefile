@@ -8,15 +8,15 @@
 #   make install-agent    install the agent + systemd unit on this host (needs root)
 #
 # Binaries produced in dist/:
-#   ipcod-coordinator, ipcod-agent, ipcod-beacon   (standalone, one per role)
-#   ipcod                                          (single-file bundle: `ipcod agent|beacon|coordinator`)
+#   ipcod-coordinator, ipcod-agent   (standalone, one per role)
+#   ipcod                           (single-file bundle: `ipcod agent|coordinator`)
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 # Stamp the version into internal/cli.Version, shared by every binary.
 LDFLAGS  = -s -w -X github.com/ipcod/ipcod/internal/cli.Version=$(VERSION)
 
-# name:pkg pairs. The three role binaries plus the unified `ipcod` bundle.
-TARGETS  = ipcod-coordinator:coordinator ipcod-agent:agent ipcod-beacon:beacon ipcod:ipcod
+# name:pkg pairs. The two role binaries plus the unified `ipcod` bundle.
+TARGETS  = ipcod-coordinator:coordinator ipcod-agent:agent ipcod:ipcod
 OUT      = dist
 
 # Targets we ship as static Linux binaries. The agent is what runs on VPSes, so
@@ -27,7 +27,7 @@ PLATFORMS = linux/amd64 linux/arm64
 
 all: build
 
-# Interactive lifecycle manager for the coordinator/agent/beacon:
+# Interactive lifecycle manager for the coordinator/agent:
 # setup, start/stop/restart, logs, health checks, token + agent CRUD.
 manage:
 	./manage.sh

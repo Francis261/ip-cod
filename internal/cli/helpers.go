@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"strings"
+	"time"
 )
 
 // envOr returns the environment variable's value, or def if unset/empty.
@@ -30,4 +31,18 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// envDuration parses a duration environment variable (e.g. "90s", "5m"),
+// falling back to def when unset or unparseable.
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
 }

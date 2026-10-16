@@ -132,6 +132,20 @@ func (c *Client) session(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close()
+	// The reads below block on a healthy connection; without this watcher a
+	// SIGTERM would stall until the server happens to send a frame (or
+	// systemd hits TimeoutStopSec and SIGKILLs us). Closing the conn on
+	// cancellation unblocks them immediately; watchDone keeps the goroutine
+	// from outliving the session when ctx stays alive.
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-watchDone:
+		}
+	}()
 
 	// Authenticate immediately.
 	auth := &protocol.Message{

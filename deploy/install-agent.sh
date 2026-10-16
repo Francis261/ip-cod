@@ -110,7 +110,7 @@ TOKEN="$REPLY"
 }
 case "$TOKEN" in
   ipca_*) : ;;
-  ipcb_*) die "that's an ipcb_ BEACON token (for the laptop). The VPS agent needs an ipca_ AGENT token — create one in the dashboard." ;;
+  ipcb_*) die "that's a legacy ipcb_ beacon token (for the old laptop reporter). The VPS agent needs an ipca_ AGENT token — create one with ./manage.sh create-agent or in the dashboard." ;;
   *)      warn "token doesn't start with ipca_; double-check it's the agent token" ;;
 esac
 

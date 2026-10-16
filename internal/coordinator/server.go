@@ -225,6 +225,9 @@ func (s *Server) pushCurrentIP(ctx context.Context, ac *agentConn) {
 		},
 	}
 	s.hub.enqueue(ac, msg)
+	// Record what we pushed so the agent's last_ip/last_seen are populated
+	// right after connect (they otherwise only fill on an IP change).
+	_ = s.store.TouchAgent(ctx, ac.id, ip, rev)
 }
 
 // HandleAgentWSPath is the http.HandlerFunc bound for the /ws route.

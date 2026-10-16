@@ -83,6 +83,12 @@ func (s *Server) observeIP(ctx context.Context, ip, beaconID string) (changed bo
 	// Fan out to every connected agent. This is best-effort: a down agent
 	// reconciles on its next connect via pushCurrentIP.
 	s.hub.broadcastIPChange(ip, newRev)
+	// Record the push per connected agent so the dashboard's "last IP"
+	// reflects what was actually sent. Best-effort; liveness alone already
+	// keeps last_seen fresh via pongs.
+	for id := range s.hub.connectedIDs() {
+		_ = s.store.TouchAgent(ctx, id, ip, newRev)
+	}
 	return true, newRev, nil
 }
 

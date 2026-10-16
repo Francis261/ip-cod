@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -15,6 +16,10 @@ type Config struct {
 	// TrustProxy makes the coordinator honor X-Forwarded-For from a reverse
 	// proxy when determining beacon source IPs.
 	TrustProxy bool
+	// Dashboard serves the web UI at "/". Without it the coordinator runs
+	// headless: agents, the admin API and health probes only, which is what
+	// `run` does. `web` turns this on.
+	Dashboard bool
 }
 
 // NewRouter assembles all HTTP routes.
@@ -65,10 +70,21 @@ func NewRouter(s *Server, cfg Config) http.Handler {
 	mux.Handle("/api/admin/", s.adminAuth(cfg.AdminToken)(admin))
 
 	// Dashboard UI (static, no auth at this layer; the admin API it calls is
-	// authed, so an unauthenticated viewer sees an empty login form).
+	// authed, so an unauthenticated viewer sees an empty login form). Served
+	// only when the web UI was asked for — `run` stays headless.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
+			return
+		}
+		if !cfg.Dashboard {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ipcod coordinator (headless)\n\n"+
+				"  agents:   WebSocket at /ws\n"+
+				"  admin:    /api/admin/* (bearer token)\n"+
+				"  health:   /healthz\n\n"+
+				"Dashboard: start with `ipcod-coordinator web -p <port>`.\n")
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

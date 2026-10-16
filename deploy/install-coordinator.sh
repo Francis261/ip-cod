@@ -79,8 +79,7 @@ printf '\n%s\n' "${B}===============================================${R}"
 printf '%s\n'     "${B} ipcod coordinator installer${R}"
 printf '%s\n'     "${B}===============================================${R}"
 printf '%s\n\n'   "Installs the coordinator as a systemd service. Put a TLS${R}
-${DIM}reverse proxy or Cloudflare tunnel in front so agents use wss://${R}
-${DIM}and beacons use https://.${R}"
+${DIM}reverse proxy or Cloudflare tunnel in front so agents use wss://.${R}"
 
 prompt "Listen address" "${LISTEN:-:8443}"
 LISTEN="$(normalize_listen "$REPLY")"
@@ -101,15 +100,40 @@ else
   fi
 fi
 
-# Trust proxy: essential behind Cloudflare / any reverse proxy.
+# Trust proxy: only relevant for legacy beacon check-ins (POST /api/beacon);
+# the coordinator's own outbound IP detection ignores it entirely.
 confirm "Running behind a reverse proxy or Cloudflare tunnel (trust X-Forwarded-For)?" "${TRUST_PROXY:-n}"
 [ "$REPLY" = y ] && TRUST_PROXY=1 || TRUST_PROXY=0
 
 if [ "$TRUST_PROXY" = 1 ]; then
-  good "TRUST_PROXY=1 — beacon source IPs will come from X-Forwarded-For"
+  good "TRUST_PROXY=1 — legacy beacon check-ins will take the client IP from X-Forwarded-For"
 else
-  printf '  %sTRUST_PROXY=0 — fine only if clients connect to the coordinator directly.\n' "$Y"
-  printf '  %sBehind Cloudflare this records the WRONG IP for every beacon.%s\n' "$Y" "$R"
+  printf '  %sTRUST_PROXY=0 — fine unless you still use the legacy beacon endpoint\n' "$Y"
+  printf '  %sbehind a proxy, in which case its check-ins get the proxy IP.%s\n' "$Y" "$R"
+fi
+
+# Web dashboard: run as `web -p <port>` instead of headless `run`. WEB=y/n
+# forces the choice (automation / manage.sh); otherwise ask, defaulting to
+# whatever is already configured (WEB_PORT non-empty = currently on).
+if [ -n "${WEB:-}" ]; then
+  case "$WEB" in [Yy]*|1) WEB=y ;; *) WEB=n ;; esac
+else
+  confirm "Serve the web dashboard (admin UI in a browser)?" \
+    "$([ -n "${WEB_PORT:-}" ] && echo y || echo n)"
+  [ "$REPLY" = y ] && WEB=y || WEB=n
+fi
+if [ "$WEB" = y ]; then
+  if [ -n "${WEB_PORT:-}" ]; then
+    info "dashboard port from environment: $WEB_PORT"
+  else
+    prompt "Dashboard port" "8443"
+    WEB_PORT="$REPLY"
+  fi
+  case "$WEB_PORT" in ''|*[!0-9]*) die "dashboard port must be a number (got '$WEB_PORT')" ;; esac
+  [ "$WEB_PORT" -ge 1 ] && [ "$WEB_PORT" -le 65535 ] || die "dashboard port must be between 1 and 65535"
+  good "web dashboard: http://127.0.0.1:$WEB_PORT/ (same API, plus the UI)"
+else
+  WEB_PORT=""
 fi
 
 # -------------------------------------------------------------------- summary
@@ -118,6 +142,8 @@ if [ "$INTERACTIVE" = 1 ]; then
   printf '  listen      : %s\n' "$LISTEN"
   printf '  admin token : %s…\n' "${ADMIN_TOKEN:0:9}"
   printf '  trust-proxy : %s\n' "$TRUST_PROXY"
+  printf '  web ui      : %s\n' "$([ "$WEB" = y ] && echo "on (port $WEB_PORT)" || echo "off — start later with: ipcod-coordinator web -p 8443")"
+  printf '  detect ip   : every 60s via public echo services (no beacon needed)\n'
   printf '  db          : /var/lib/ipcod/ipcod.db\n'
   printf '  binary      : /usr/local/bin/ipcod-coordinator\n'
   printf '  unit        : /etc/systemd/system/ipcod-coordinator.service\n\n'
@@ -160,25 +186,54 @@ IPCOD_LISTEN=$LISTEN
 IPCOD_ADMIN_TOKEN=$ADMIN_TOKEN
 
 # 1 = trust X-Forwarded-For (behind a reverse proxy / Cloudflare tunnel);
-# 0 = use the direct socket address (only if clients connect straight in).
+# 0 = use the direct socket address (only affects legacy beacon check-ins).
 IPCOD_TRUST_PROXY=$TRUST_PROXY
+
+# Outbound public-IP detection (the replacement for the old beacon process).
+# Defaults are built into the binary; uncomment to override.
+#IPCOD_DETECT_INTERVAL=60s
+#IPCOD_IP_PROVIDERS=https://api.ipify.org,https://icanhazip.com
+#IPCOD_NO_DETECT=0
 EOF
 chmod 0600 "$ENV_FILE"
 good "wrote $ENV_FILE (root:root, 0600)"
 
 info "installing systemd unit + starting"
 install -m 0644 "$REPO_DIR/deploy/ipcod-coordinator.service" /etc/systemd/system/ipcod-coordinator.service
+
+# Swap ExecStart to `web -p <port>` when the dashboard was requested; remove a
+# stale drop-in otherwise so re-running the installer returns to headless.
+DROPIN_DIR=/etc/systemd/system/ipcod-coordinator.service.d
+if [ "$WEB" = y ]; then
+  info "enabling the web dashboard on port $WEB_PORT (unit drop-in)"
+  mkdir -p "$DROPIN_DIR"
+  cat > "$DROPIN_DIR/web.conf" <<EOF
+# Written by install-coordinator.sh: run the coordinator as \`web -p $WEB_PORT\`.
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/ipcod-coordinator web -p $WEB_PORT
+EOF
+elif [ -f "$DROPIN_DIR/web.conf" ]; then
+  rm -f "$DROPIN_DIR/web.conf"
+  rmdir "$DROPIN_DIR" 2>/dev/null || true
+  info "web dashboard disabled (removed the drop-in)"
+fi
+
 systemctl daemon-reload
-systemctl enable --now ipcod-coordinator >/dev/null 2>&1 || true
+if systemctl is-active --quiet ipcod-coordinator; then
+  # Already running: restart so the new env (and drop-in) actually take effect.
+  systemctl restart ipcod-coordinator >/dev/null 2>&1 || true
+else
+  systemctl enable --now ipcod-coordinator >/dev/null 2>&1 || true
+fi
 
 # ------------------------------------------------------------------ healthz
 sleep 1
-# Derive a loopback URL regardless of how LISTEN is spelled.
-HOSTPORT="${LISTEN#:}"; HOSTPORT="${HOSTPORT#:}"
-case "$HOSTPORT" in
-  *:*) LOOP="http://127.0.0.1:${HOSTPORT}" ;;
-  *)   LOOP="http://127.0.0.1:${HOSTPORT}" ;;
-esac
+# Derive a loopback URL regardless of how LISTEN is spelled:
+# ":8443", "127.0.0.1:8443", "0.0.0.0:8443", "[::1]:8443".
+PORT="${LISTEN##*:}"
+case "$PORT" in ''|*[!0-9]*) PORT=8443 ;; esac
+LOOP="http://127.0.0.1:${PORT}"
 ok=0
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   if curl -sf --max-time 2 "$LOOP/healthz" >/dev/null 2>&1; then ok=1; break; fi
@@ -198,7 +253,12 @@ printf '  status  : %ssystemctl status ipcod-coordinator%s\n' "$DIM" "$R"
 printf '  logs    : %sjournalctl -u ipcod-coordinator -f%s\n' "$DIM" "$R"
 printf '  health  : %scurl -s %s/healthz%s\n' "$DIM" "$LOOP" "$R"
 printf '  config  : %s%s%s\n' "$DIM" "$ENV_FILE" "$R"
-printf '\n  %sIMPORTANT:%s agents/beacons should reach this via wss:// / https://.\n' "$RD" "$R"
-printf '  Put a TLS reverse proxy (Caddy/nginx) or Cloudflare tunnel in front,\n'
-printf '  then point agents at wss://<your-host>/ws and beacons at\n'
-printf '  https://<your-host>/api/beacon.\n\n'
+if [ "$WEB" = y ]; then
+  printf '  web ui  : open http://127.0.0.1:%s/ (or http://<host>:%s/ remotely)\n' "$WEB_PORT" "$WEB_PORT"
+else
+  printf '  web ui  : %s ipcod-coordinator web -p 8443%s to serve the dashboard\n' "$DIM" "$R"
+fi
+printf '\n  %sIMPORTANT:%s point agents at wss://<your-host>/ws — put a TLS reverse\n' "$RD" "$R"
+printf '  proxy (Caddy/nginx) or a Cloudflare tunnel in front so wss:// works.\n'
+printf '  The coordinator learns the public IP on its own; nothing else\n'
+printf '  needs to run on this machine.\n\n'
