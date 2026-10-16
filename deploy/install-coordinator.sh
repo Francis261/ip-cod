@@ -25,12 +25,12 @@ die(){  printf '%s\n' "${RD}✗${R} $*" >&2; exit 1; }
 INTERACTIVE=0; [ -t 0 ] && INTERACTIVE=1
 
 prompt(){   # prompt "message" "default" -> $REPLY
-  local msg="$1" def="${2-}" hint reply
+  local msg="$1" def="${2-}" hint="" reply=""
   if [ "$INTERACTIVE" != 1 ]; then REPLY="$def"; return 0; fi
   [ -n "$def" ] && hint=" [$def]"
   while true; do
     printf '%s%s: ' "$msg" "$hint"
-    IFS= read -r reply || reply=""
+    if ! IFS= read -r reply; then printf '\n'; die "aborted — end of input"; fi
     reply="${reply:-$def}"
     if [ -n "$reply" ]; then REPLY="$reply"; return 0; fi
     printf '%s\n' "  ${DIM}(a value is required)${R}"
@@ -38,12 +38,12 @@ prompt(){   # prompt "message" "default" -> $REPLY
 }
 
 confirm(){  # confirm "message" y|n -> $REPLY
-  local msg="$1" def="${2:-n}" hint reply
+  local msg="$1" def="${2:-n}" hint="" reply=""
   if [ "$INTERACTIVE" != 1 ]; then REPLY="$def"; return 0; fi
   if [ "$def" = y ]; then hint="Y/n"; else hint="y/N"; fi
   while true; do
     printf '%s [%s]: ' "$msg" "$hint"
-    IFS= read -r reply || reply=""
+    if ! IFS= read -r reply; then printf '\n'; die "aborted — end of input"; fi
     reply="${reply:-$def}"
     case "$reply" in
       [Yy]*) REPLY=y; return 0 ;;
