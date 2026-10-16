@@ -34,6 +34,9 @@
   .muted { color:var(--muted); }
   #login { max-width:360px; margin:80px auto; }
   .err { color:var(--bad); font-size:13px; min-height:18px; }
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:20; }
+  .modal .card { width:420px; margin:70px auto; }
+  .modal label { margin-top:10px; }
 </style>
 </head>
 <body>
@@ -70,11 +73,11 @@
 
     <div class="card">
       <h2>Agents</h2>
-      <table><thead><tr><th>Name</th><th>Port</th><th>Status</th><th>Last IP</th><th>Last seen</th><th></th></tr></thead>
+      <table><thead><tr><th>Name</th><th>Ports</th><th>Status</th><th>Last IP</th><th>Last seen</th><th></th></tr></thead>
       <tbody id="agents"></tbody></table>
       <div style="margin-top:16px" class="form-grid">
         <div><label>Name</label><input id="aName" placeholder="web-1"></div>
-        <div><label>Port</label><input id="aPort" type="number" placeholder="22"></div>
+        <div><label>Ports (comma-separated)</label><input id="aPort" placeholder="22,443"></div>
         <div><label>Proto</label><input id="aProto" placeholder="tcp"></div>
         <div><button onclick="createAgent()">Add agent</button></div>
       </div>
@@ -103,9 +106,43 @@
   </main>
 </div>
 
+<div id="agentEdit" class="modal" style="display:none">
+  <div class="card">
+    <h2>Edit agent</h2>
+    <label>Name</label><input id="mName" placeholder="web-1">
+    <label>Ports (comma-separated)</label><input id="mPorts" placeholder="22,443">
+    <label>Proto</label><input id="mProto" placeholder="tcp">
+    <label style="display:flex; align-items:center; gap:8px; margin-top:12px">
+      <input id="mEnabled" type="checkbox" style="width:auto"> Enabled (may authenticate)
+    </label>
+    <div style="display:flex; gap:10px; margin-top:16px">
+      <button onclick="saveAgent()">Save</button>
+      <button class="ghost" onclick="closeEdit()">Cancel</button>
+    </div>
+    <p class="muted" style="font-size:12px; margin:12px 0 0">
+      Port changes are pushed to the agent immediately (it repairs its firewall rules),
+      or within one reconcile interval if it is currently offline.
+    </p>
+  </div>
+</div>
+
 <script>
 const TOKEN_KEY = 'ipcod_admin_token';
 let TOKEN = sessionStorage.getItem(TOKEN_KEY) || '';
+let AGENTS = []; // cached agent list, used by the edit modal
+
+// parsePortsInput turns "22,443" into [22,443]; returns null on any invalid entry.
+function parsePortsInput(s){
+  const out = [];
+  for (const part of String(s).split(',')) {
+    const t = part.trim();
+    if (!t) return null;
+    const n = parseInt(t, 10);
+    if (!Number.isInteger(n) || n < 1 || n > 65535 || String(n) !== t || out.includes(n)) return null;
+    out.push(n);
+  }
+  return out.sort((a,b)=>a-b);
+}
 
 async function api(path, opts = {}) {
   opts.headers = Object.assign({'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json'}, opts.headers || {});
@@ -149,13 +186,15 @@ async function refresh(){
 
   try {
     const {agents} = await api('/api/admin/agents');
+    AGENTS = agents;
     document.getElementById('agents').innerHTML = agents.map(a => `<tr>
       <td>${esc(a.name)}</td>
-      <td>${esc(a.port)}/${esc(a.proto||'tcp')}</td>
+      <td>${esc((a.ports && a.ports.length ? a.ports : [a.port]).join(', '))}/${esc(a.proto||'tcp')}</td>
       <td><span class="pill ${a.connected?'on':'off'}">${a.connected?'connected':'offline'}</span></td>
       <td>${esc(a.last_ip)||'—'}</td>
       <td>${esc(a.last_seen)||'—'}</td>
       <td>
+        <button class="ghost" onclick="editAgent('${a.id}')">Edit</button>
         <button class="ghost" onclick="rotateAgent('${a.id}')">Rotate token</button>
         <button class="danger" onclick="delAgent('${a.id}')">Delete</button>
       </td></tr>`).join('') || '<tr><td colspan=6 class=muted>No agents yet.</td></tr>';
@@ -191,15 +230,42 @@ async function setIP(){
 
 async function createAgent(){
   const name = document.getElementById('aName').value.trim();
-  const port = parseInt(document.getElementById('aPort').value, 10);
+  const ports = parsePortsInput(document.getElementById('aPort').value);
   const proto = document.getElementById('aProto').value.trim() || 'tcp';
-  if(!name || !port) return alert('Name and port required');
+  if(!name || !ports) return alert('Name and at least one valid port required (comma-separated, e.g. 22,443)');
   try {
-    const res = await api('/api/admin/agents', {method:'POST', body: JSON.stringify({name, port, proto})});
+    const res = await api('/api/admin/agents', {method:'POST', body: JSON.stringify({name, ports, proto})});
     const box = document.getElementById('agentTokenBox');
     box.style.display='block';
     box.textContent = 'Agent "' + res.agent.name + '" token (copy now, shown once): ' + res.token;
     document.getElementById('aName').value=''; document.getElementById('aPort').value='';
+    refresh();
+  } catch(e){ alert(e.message); }
+}
+
+function editAgent(id){
+  const a = AGENTS.find(x => x.id === id);
+  if(!a) return;
+  document.getElementById('mName').value = a.name;
+  document.getElementById('mPorts').value = (a.ports && a.ports.length ? a.ports : [a.port]).join(',');
+  document.getElementById('mProto').value = a.proto || 'tcp';
+  document.getElementById('mEnabled').checked = !!a.enabled;
+  document.getElementById('agentEdit').dataset.id = id;
+  document.getElementById('agentEdit').style.display = 'block';
+}
+function closeEdit(){ document.getElementById('agentEdit').style.display = 'none'; }
+
+async function saveAgent(){
+  const modal = document.getElementById('agentEdit');
+  const id = modal.dataset.id;
+  const name = document.getElementById('mName').value.trim();
+  const ports = parsePortsInput(document.getElementById('mPorts').value);
+  const proto = document.getElementById('mProto').value.trim() || 'tcp';
+  const enabled = document.getElementById('mEnabled').checked;
+  if(!name || !ports) return alert('Name and at least one valid port required (comma-separated, e.g. 22,443)');
+  try {
+    await api('/api/admin/agents/'+id, {method:'PATCH', body: JSON.stringify({name, ports, proto, enabled})});
+    closeEdit();
     refresh();
   } catch(e){ alert(e.message); }
 }

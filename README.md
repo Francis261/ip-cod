@@ -25,7 +25,8 @@ your current IP.
    │  is the one you want allowed)                                         │
    │                                                                       │
    │   • discovers this machine's public IP itself (no helper process)     │
-   │   • pushes changes to every connected agent                           │
+   │   • pushes changes to every connected agent, and re-asserts the       │
+   │     current IP+ports to them every 30s (self-heal)                    │
    │   • admin API + web dashboard, served on demand (`web -p 8443`)       │
    └───────────────────────────────▲───────────────────────────────────────┘
                                    │ WebSocket /ws (persistent; the AGENT
@@ -34,7 +35,8 @@ your current IP.
    ┌───────────────────────────────┴───────────────────────────────────────┐
    │  Agent — one per VPS, manages ufw                                     │
    │   • connects out to the coordinator                                   │
-   │   • on change: allow <current IP> → <port>, replacing the old rule    │
+   │   • on each push: ensure allow <current IP> → <ports>, replacing      │
+   │     rules that no longer match (missing ones are re-added)            │
    └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -44,14 +46,18 @@ your current IP.
      outbound over HTTPS and taking the majority answer, re-checking every
      minute — nothing else needs to run on your laptop,
    - accepts **outbound WebSocket** connections from agents (authed with a
-     per-agent bearer token) and broadcasts IP changes,
+     per-agent bearer token), broadcasts IP changes, and re-asserts the
+     current IP+ports to every connected agent every 30 seconds (so a rule
+     deleted out-of-band gets repaired without waiting for a change),
    - serves an **admin dashboard and REST API** — the dashboard only when you
      ask for it: `ipcod-coordinator web -p 8443` (plain `run` is headless).
 
 2. **Agent** — a small daemon installed on each VPS. It dials the coordinator
    (outbound only, so no inbound ports are needed on the VPS to reach the
-   coordinator) and, on each IP change, runs the right `ufw` commands to allow
-   the new IP → port, removing the old rule.
+   coordinator) and, on each push, converges `ufw` to exactly the right state:
+   allow the current laptop IP → its configured **ports** (one agent can guard
+   several, e.g. `22,443`), replacing rules that no longer match and re-adding
+   missing ones.
 
 **Why agents dial out:** VPSes can almost always make outbound connections,
 even when inbound is filtered. A pull model means you open zero inbound ports
@@ -86,14 +92,17 @@ deployments don't need it; the endpoint and its dashboard card are labelled
   just a UI over it. Set `ADMIN_TOKEN` or the admin API is **disabled
   (fail-closed)**.
 - **Revision counter** on IP updates: each change increments a monotonic
-  revision, and agents ignore any update with a revision ≤ the last one they
-  applied, preventing stale/replayed updates.
-- **`ufw` rules are scoped and replaced, not accumulated.** The agent tracks
-  the single rule it applied and, on change, deletes the old one before adding
-  the new. It tags rules with an `ipcod` comment so you can find them in
-  `ufw status`. **The delete-before-add order matters:** it never leaves a
-  window where a stale IP is still allowed (it briefly allows neither, which is
-  the safe direction).
+  revision, and agents ignore any update with a revision **older** than the
+  last one they saw, preventing stale/replayed updates. Equal revisions are
+  the coordinator's periodic re-assertions of the *current* state — safe to
+  process, and the agent just re-verifies its rules (a no-op when they match).
+- **`ufw` rules are scoped and replaced, not accumulated.** The agent tags
+  every rule it creates with an `ipcod` comment and only ever manages rules
+  carrying that tag — it never touches rules you added yourself. On each push
+  it compares `ufw status` against the desired state and touches only the
+  difference. **Deletes run before adds**, so there is never a window where a
+  stale IP is still allowed (it briefly allows neither, which is the safe
+  direction).
 
 > ⚠️ **Read before pointing this at SSH (port 22).** If the coordinator is
 > unreachable, the agent simply **keeps the last rule** — it does not tear
@@ -118,8 +127,8 @@ IPCOD_ADMIN_TOKEN=devadmin ./dist/ipcod-coordinator web -p 8443 \
 # ...or via the unified binary: ./dist/ipcod coordinator web -p 8443 ...
 
 # 2. In the browser: open http://127.0.0.1:8443, sign in with "devadmin",
-#    create an agent (name + port), copy the token (shown once). The dashboard
-#    shows the public IP this machine detected for itself.
+#    create an agent (name + ports, e.g. 22,443), copy the token (shown once).
+#    The dashboard shows the public IP this machine detected for itself.
 
 # 3. Start an agent in dry-run (no real ufw changes):
 IPCOD_COORDINATOR=ws://127.0.0.1:8443/ws \
@@ -145,7 +154,7 @@ COORD=wss://coord.example.com/ws TOKEN=ipca_xxx ./manage.sh setup agent
 ./manage.sh logs agent -f        # journalctl (or the dev log) for a component
 ./manage.sh web 8443             # dashboard on http://127.0.0.1:8443/
 ./manage.sh web off              # back to headless (coordinator keeps running)
-./manage.sh create-agent web-1 22        # via the admin API; token shown once
+./manage.sh create-agent web-1 22,443   # via the admin API; token shown once
 ./manage.sh -y rotate web-1              # rotates AND rewrites the local env + restarts
 ./manage.sh dry-run on           # flip the agent between log-only and live ufw
 ./manage.sh -y ip 203.0.113.7    # force-push an IP
@@ -238,8 +247,10 @@ bearer token. It shows:
 
 - **Current public IP**, revision, last-changed time, and how many agents are
   connected. Includes a **"Force IP"** override to push a specific IP manually.
-- **Agents table** — per-agent port, live connected/offline status, last IP
-  pushed, last seen, plus **create / rotate-token / delete**.
+- **Agents table** — per-agent ports, live connected/offline status, last IP
+  pushed, last seen, plus **create / edit / rotate-token / delete** (the edit
+  dialog changes name, ports, proto, or enabled; port changes are pushed to a
+  connected agent immediately).
 - **Beacon override (legacy)** — only needed for old `ipcod-beacon` binaries.
 - **Recent IP history** — audit trail of changes, with the source (`detected`
   for automatic detection, a beacon name for legacy check-ins).
@@ -254,8 +265,8 @@ All under `/api/admin/*`, guarded by `Authorization: Bearer <ADMIN_TOKEN>`.
 | `POST /api/admin/ip` | force-set the public IP `{"ip":"1.2.3.4"}` |
 | `GET  /api/admin/ip-history?limit=N` | recent IP changes |
 | `GET  /api/admin/agents` | list agents (with live status) |
-| `POST /api/admin/agents` | create agent `{name,port,proto}` → returns token **once** |
-| `PATCH /api/admin/agents/{id}` | update `{name?,port?,proto?,enabled?}` |
+| `POST /api/admin/agents` | create agent `{name,ports:[…],proto}` → returns token **once** |
+| `PATCH /api/admin/agents/{id}` | update `{name?,ports?,port?,proto?,enabled?}` |
 | `POST /api/admin/agents/{id}/rotate` | rotate token → new token **once** |
 | `DELETE /api/admin/agents/{id}` | delete agent |
 | `GET/POST /api/admin/beacons`, `PATCH/DELETE/…/{id}`, `…/{id}/rotate` | legacy beacon CRUD |
@@ -278,6 +289,7 @@ Legacy beacon check-in (bearer = the beacon's own token, not the admin token):
 | `-admin-token` | `IPCOD_ADMIN_TOKEN` | — | admin bearer token (empty ⇒ admin API off) |
 | `-trust-proxy` | `IPCOD_TRUST_PROXY` | `0` | trust `X-Forwarded-For` (legacy beacon check-ins) |
 | `-detect-interval` | `IPCOD_DETECT_INTERVAL` | `60s` | public-IP re-check interval |
+| `-reconcile-interval` | `IPCOD_RECONCILE_INTERVAL` | `30s` | how often to re-push the current IP+ports to connected agents (self-heal; `0` disables) |
 | `-providers` | `IPCOD_IP_PROVIDERS` | built-in list | comma-separated echo-service URLs |
 | `-no-detect` | `IPCOD_NO_DETECT` | `0` | disable outbound detection (set IP manually / legacy beacon) |
 | `-v` | — | `false` | debug logging |
@@ -374,6 +386,14 @@ of `ipcod`, `ipcod-coordinator`, `ipcod-agent`, plus `dist/SHA256SUMS`.
 - **Agent keeps last rule on coordinator loss.** By design, an unreachable
   coordinator is a no-op — the firewall stays as-is. Availability of your
   access is preferred over aggressive re-locking.
+- **Periodic re-assertion (self-heal).** Besides pushing on change and on
+  connect, the coordinator re-sends the current IP+ports to every connected
+  agent every 30s (`-reconcile-interval`/`IPCOD_RECONCILE_INTERVAL`, `0`
+  disables). Agents treat it as a state assertion: they diff it against
+  `ufw status` and touch only the difference, so a rule deleted out-of-band is
+  repaired within one interval, while an unchanged rule is a silent (debug-log)
+  no-op — no log spam, no needless `ufw` writes. One read-only `ufw status`
+  runs per interval to verify.
 - **Reconciliation on connect.** When an agent (re)connects, the coordinator
   immediately pushes the current IP, so an agent that was down during a change
   catches up without waiting for the next change.

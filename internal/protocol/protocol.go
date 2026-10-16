@@ -49,22 +49,45 @@ type AuthPayload struct {
 }
 
 // IPChangedPayload tells the agent the laptop's current public IP and which
-// port to allow it to reach.
+// ports to allow it to reach. The coordinator sends it on change, on agent
+// connect, and periodically as a state assertion; agents verify their firewall
+// still matches and repair it if not.
 type IPChangedPayload struct {
-	IP   string `json:"ip"`
+	IP string `json:"ip"`
+	// Port is the first guarded port, kept for older agents that only
+	// understand a single port.
 	Port uint16 `json:"port"`
+	// Ports is the full list of ports to allow. When empty, receivers fall
+	// back to Port (older coordinator).
+	Ports []uint16 `json:"ports,omitempty"`
 	// Proto is the IP protocol, e.g. "tcp" or "udp". Empty means "tcp".
 	Proto string `json:"proto,omitempty"`
 	// Revision is a monotonically increasing counter so agents can ignore
-	// stale or replayed updates.
+	// stale or replayed updates. Periodic re-assertions reuse the current
+	// revision; agents only drop strictly older ones.
 	Revision uint64 `json:"revision"`
 }
 
-// SetPortPayload tells the agent to change the port it guards without changing
-// the allowed IP.
+// EffectivePorts returns the ports to guard, tolerating payloads from a
+// coordinator that only carries the single Port field.
+func (p *IPChangedPayload) EffectivePorts() []uint16 {
+	switch {
+	case len(p.Ports) > 0:
+		return p.Ports
+	case p.Port > 0:
+		return []uint16{p.Port}
+	default:
+		return nil
+	}
+}
+
+// SetPortPayload tells the agent to change the ports it guards without
+// changing the allowed IP. (Superseded by ip_changed, which now carries the
+// ports too; kept for wire compatibility.)
 type SetPortPayload struct {
-	Port  uint16 `json:"port"`
-	Proto string `json:"proto,omitempty"`
+	Port  uint16   `json:"port"`
+	Ports []uint16 `json:"ports,omitempty"`
+	Proto string   `json:"proto,omitempty"`
 }
 
 // ErrorPayload carries a human-readable error description.

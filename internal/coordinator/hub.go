@@ -14,7 +14,7 @@ import (
 type agentConn struct {
 	id    string // agent ID
 	name  string
-	port  uint16
+	ports []uint16
 	proto string
 	conn  *websocket.Conn
 
@@ -52,7 +52,7 @@ func (h *hub) register(ac *agentConn) {
 	}
 	h.conns[ac.id] = ac
 	h.mu.Unlock()
-	h.log.Info("agent connected", "agent", ac.name, "id", ac.id, "port", ac.port)
+	h.log.Info("agent connected", "agent", ac.name, "id", ac.id, "ports", ac.ports)
 }
 
 // unregister removes the connection only if it is still the registered one for
@@ -69,12 +69,12 @@ func (h *hub) unregister(ac *agentConn) {
 	h.mu.Unlock()
 }
 
-// setPort updates the remembered guard port for a connected agent so future
-// broadcasts use the right value.
-func (h *hub) setPort(id string, port uint16, proto string) {
+// setPorts updates the remembered guard ports for a connected agent so future
+// broadcasts use the new values.
+func (h *hub) setPorts(id string, ports []uint16, proto string) {
 	h.mu.Lock()
 	if ac, ok := h.conns[id]; ok {
-		ac.port = port
+		ac.ports = ports
 		ac.proto = proto
 	}
 	h.mu.Unlock()
@@ -130,7 +130,8 @@ func (h *hub) broadcastIPChange(ip string, revision uint64) {
 			Type: protocol.TypeIPChanged,
 			IPChanged: &protocol.IPChangedPayload{
 				IP:       ip,
-				Port:     ac.port,
+				Port:     primaryPort(ac.ports),
+				Ports:    ac.ports,
 				Proto:    ac.proto,
 				Revision: revision,
 			},
@@ -161,6 +162,15 @@ func (h *hub) enqueue(ac *agentConn, msg *protocol.Message) bool {
 			"agent", ac.name, "id", ac.id, "type", msg.Type)
 		return false
 	}
+}
+
+// primaryPort returns the first guarded port (0 when the list is empty) — the
+// single-port field older agents still understand.
+func primaryPort(ports []uint16) uint16 {
+	if len(ports) == 0 {
+		return 0
+	}
+	return ports[0]
 }
 
 // close tears down a single connection: closes the send queue (once) and the

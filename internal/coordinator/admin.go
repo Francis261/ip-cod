@@ -2,7 +2,9 @@ package coordinator
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -32,22 +34,24 @@ func (s *Server) adminAuth(adminToken string) func(http.Handler) http.Handler {
 // ---- agent management ----
 
 type agentView struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Port      uint16 `json:"port"`
-	Proto     string `json:"proto"`
-	Enabled   bool   `json:"enabled"`
-	Connected bool   `json:"connected"`
-	LastSeen  string `json:"last_seen"`
-	LastIP    string `json:"last_ip"`
-	CreatedAt string `json:"created_at"`
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Port      uint16   `json:"port"`  // first port, kept for older clients
+	Ports     []uint16 `json:"ports"` // all guarded ports
+	Proto     string   `json:"proto"`
+	Enabled   bool     `json:"enabled"`
+	Connected bool     `json:"connected"`
+	LastSeen  string   `json:"last_seen"`
+	LastIP    string   `json:"last_ip"`
+	CreatedAt string   `json:"created_at"`
 }
 
 func (s *Server) agentView(a store.Agent) agentView {
 	return agentView{
 		ID:        a.ID,
 		Name:      a.Name,
-		Port:      a.Port,
+		Port:      a.PrimaryPort(),
+		Ports:     a.Ports,
 		Proto:     a.Proto,
 		Enabled:   a.Enabled,
 		Connected: s.hub.isLive(a.ID),
@@ -72,9 +76,10 @@ func (s *Server) HandleListAgents(w http.ResponseWriter, r *http.Request) {
 }
 
 type createAgentReq struct {
-	Name  string `json:"name"`
-	Port  uint16 `json:"port"`
-	Proto string `json:"proto,omitempty"`
+	Name  string   `json:"name"`
+	Port  uint16   `json:"port"`  // single-port form, older clients
+	Ports []uint16 `json:"ports"` // all ports to guard
+	Proto string   `json:"proto,omitempty"`
 }
 
 // HandleCreateAgent POST /api/admin/agents
@@ -86,11 +91,20 @@ func (s *Server) HandleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
-	if req.Name == "" || req.Port == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name and port are required"})
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
 		return
 	}
-	a, plain, err := s.store.CreateAgent(r.Context(), req.Name, req.Port, normalizeProto(req.Proto))
+	ports := req.Ports
+	if len(ports) == 0 && req.Port > 0 {
+		ports = []uint16{req.Port}
+	}
+	ports, err := normalizePorts(ports)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	a, plain, err := s.store.CreateAgent(r.Context(), req.Name, ports, normalizeProto(req.Proto))
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
@@ -105,10 +119,11 @@ func (s *Server) HandleCreateAgent(w http.ResponseWriter, r *http.Request) {
 // HandleUpdateAgent PATCH /api/admin/agents/{id}
 func (s *Server) HandleUpdateAgent(w http.ResponseWriter, r *http.Request, id string) {
 	var req struct {
-		Name    *string `json:"name"`
-		Port    *uint16 `json:"port"`
-		Proto   *string `json:"proto"`
-		Enabled *bool   `json:"enabled"`
+		Name    *string   `json:"name"`
+		Port    *uint16   `json:"port"`  // single-port form, older clients
+		Ports   *[]uint16 `json:"ports"` // replaces the whole port list
+		Proto   *string   `json:"proto"`
+		Enabled *bool     `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -126,23 +141,24 @@ func (s *Server) HandleUpdateAgent(w http.ResponseWriter, r *http.Request, id st
 			return
 		}
 	}
-	if req.Port != nil {
+	if req.Ports != nil || req.Port != nil || req.Proto != nil {
+		var ports []uint16
+		switch {
+		case req.Ports != nil:
+			ports = *req.Ports
+		case req.Port != nil:
+			ports = []uint16{*req.Port}
+		}
 		proto := ""
 		if req.Proto != nil {
 			proto = normalizeProto(*req.Proto)
 		}
-		if err := s.SetPort(r.Context(), id, *req.Port, proto); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-	} else if req.Proto != nil {
-		ag, err := s.store.GetAgent(r.Context(), id)
-		if err != nil {
-			writeJSON(w, httpStatusFor(err), map[string]string{"error": err.Error()})
-			return
-		}
-		if err := s.SetPort(r.Context(), id, ag.Port, normalizeProto(*req.Proto)); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		if err := s.SetPort(r.Context(), id, ports, proto); err != nil {
+			code := http.StatusBadRequest
+			if errors.Is(err, store.ErrNotFound) {
+				code = http.StatusNotFound
+			}
+			writeJSON(w, code, map[string]string{"error": err.Error()})
 			return
 		}
 	}
@@ -350,6 +366,27 @@ func (s *Server) HandleIPHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- helpers ----
+
+// normalizePorts validates a port list and canonicalizes it (sorted,
+// deduplicated) so storage and pushes are stable regardless of input order.
+func normalizePorts(ports []uint16) ([]uint16, error) {
+	if len(ports) == 0 {
+		return nil, errors.New("at least one port is required")
+	}
+	seen := make(map[uint16]bool, len(ports))
+	out := make([]uint16, 0, len(ports))
+	for _, p := range ports {
+		if p == 0 {
+			return nil, errors.New("ports must be between 1 and 65535")
+		}
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
 
 func normalizeProto(p string) string {
 	p = strings.ToLower(strings.TrimSpace(p))

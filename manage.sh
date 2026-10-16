@@ -665,7 +665,7 @@ EOF
   fi
   printf '\n  Next: the dashboard is served on demand — %s./manage.sh web 8443%s —\n' "$DIM" "$R"
   printf '  sign in with the admin token, and create an agent with\n'
-  printf '  %s./manage.sh create-agent <name> <port>%s.\n' "$DIM" "$R"
+  printf '  %s./manage.sh create-agent <name> <port[,port…]>%s.\n' "$DIM" "$R"
   printf '  The coordinator detects the public IP by itself; agents only need\n'
   printf '  %swss://<your-host>/ws%s.\n\n' "$DIM" "$R"
 }
@@ -859,16 +859,16 @@ list_agents(){
   body="$(admin_req GET /api/admin/agents)"
   if have_jq; then
     printf '%s' "$body" | jq -r \
-      '.agents[] | "  \(.id)  \(.name)  port=\(.port // "-")  enabled=\(.enabled)  last_ip=\(.last_ip // "-")  seen=\(.last_seen // "-")"'
+      '.agents[] | "  \(.id)  \(.name)  ports=\((.ports // [.port]) | map(tostring) | join(","))  enabled=\(.enabled)  last_ip=\(.last_ip // "-")  seen=\(.last_seen // "-")"'
   elif have_py; then
     printf '%s' "$body" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 for it in d.get("agents") or []:
-    extra = "port=%s " % it["port"] if "port" in it else ""
-    print("  %s  %s  %senabled=%s  last_ip=%s  seen=%s" % (
-        it.get("id",""), it.get("name",""), extra, it.get("enabled",""),
-        it.get("last_ip") or "-", it.get("last_seen") or "-"))'
+    ports = it.get("ports") or ([it["port"]] if it.get("port") else [])
+    print("  %s  %s  ports=%s  enabled=%s  last_ip=%s  seen=%s" % (
+        it.get("id",""), it.get("name",""), ",".join(str(p) for p in ports),
+        it.get("enabled",""), it.get("last_ip") or "-", it.get("last_seen") or "-"))'
   else
     printf '%s' "$body" | json_pp
   fi
@@ -908,20 +908,26 @@ resolve_id(){ # name-or-id -> id
   [ -n "$id" ] && printf '%s' "$id" || printf '%s' "$ref"
 }
 
-cmd_create_agent(){ # name port [proto]
+cmd_create_agent(){ # name port[,port...] [proto]
   banner
-  local name="${1:-}" port="${2:-}" proto="${3:-}"
+  local name="${1:-}" ports="${2:-}" proto="${3:-}"
   [ -n "$name" ] || { prompt "Agent name"; name="$REPLY"; }
-  [ -n "$port" ] || { prompt "Port to guard (e.g. 22)"; port="$REPLY"; }
+  [ -n "$ports" ] || { prompt "Ports to guard, comma-separated (e.g. 22 or 22,443)"; ports="$REPLY"; }
   [ -n "$proto" ] || { prompt "Protocol (tcp/udp)" "tcp"; proto="$REPLY"; }
-  case "$port" in ''|*[!0-9]*) die "port must be a number (got '$port')" ;; esac
-  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "port must be between 1 and 65535"
+  case "$ports" in ''|*[!0-9,]*) die "ports must be comma-separated numbers (got '$ports')" ;; esac
+  local p json_ports=""
+  for p in ${ports//,/ }; do
+    [ -n "$p" ] || die "empty port in '$ports'"
+    [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || die "port must be between 1 and 65535 (got '$p')"
+    json_ports="${json_ports:+$json_ports,}$p"
+  done
+  [ -n "$json_ports" ] || die "at least one port is required"
   case "$proto" in tcp|udp) : ;; *) die "protocol must be tcp or udp (got '$proto')" ;; esac
   local out tok
   out="$(admin_req POST /api/admin/agents \
-    "{\"name\":\"$(json_escape "$name")\",\"port\":$port,\"proto\":\"$proto\"}")"
+    "{\"name\":\"$(json_escape "$name")\",\"ports\":[$json_ports],\"proto\":\"$proto\"}")"
   tok="$(printf '%s' "$out" | json_str token)"
-  good "agent '$name' created (port $port/$proto)"
+  good "agent '$name' created (ports $ports/$proto)"
   show_token_once "$tok"
   printf '  Use it on the VPS:\n'
   printf '    %ssudo COORD=wss://<your-coordinator>/ws TOKEN=%s ./deploy/install-agent.sh%s\n\n' "$DIM" "$tok" "$R"
@@ -1215,7 +1221,7 @@ ${B}Commands${R}
   health                          run health checks (healthz, agent check, public IP)
   build                           build the binaries into dist/
   list                            list registered agents (admin API)
-  create-agent <name> <port> [proto]   create an agent, print its token once
+  create-agent <name> <port[,port…]> [proto]  create an agent, print its token once
   rotate      [name|id]           rotate an agent token
   enable|disable <name|id>        toggle an agent
   delete      <name|id>           delete an agent

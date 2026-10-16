@@ -79,7 +79,7 @@ func (s *Server) HandleAgentWS(w http.ResponseWriter, r *http.Request) {
 	ac := &agentConn{
 		id:    agent.ID,
 		name:  agent.Name,
-		port:  agent.Port,
+		ports: agent.Ports,
 		proto: agent.Proto,
 		conn:  conn,
 		send:  make(chan *protocol.Message, 64),
@@ -219,7 +219,8 @@ func (s *Server) pushCurrentIP(ctx context.Context, ac *agentConn) {
 		Type: protocol.TypeIPChanged,
 		IPChanged: &protocol.IPChangedPayload{
 			IP:       ip,
-			Port:     ac.port,
+			Port:     primaryPort(ac.ports),
+			Ports:    ac.ports,
 			Proto:    ac.proto,
 			Revision: rev,
 		},

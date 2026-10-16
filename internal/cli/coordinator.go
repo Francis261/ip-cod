@@ -93,6 +93,7 @@ func coordinatorFlags(fs *flag.FlagSet, withPort bool) {
 	fs.String("admin-token", os.Getenv("IPCOD_ADMIN_TOKEN"), "admin bearer token for /api/admin (or env IPCOD_ADMIN_TOKEN)")
 	fs.Bool("trust-proxy", envBool("IPCOD_TRUST_PROXY"), "honor X-Forwarded-For (set when behind a reverse proxy)")
 	fs.Duration("detect-interval", envDuration("IPCOD_DETECT_INTERVAL", coordinator.DefaultDetectInterval), "how often to re-check this machine's public IP")
+	fs.Duration("reconcile-interval", envDuration("IPCOD_RECONCILE_INTERVAL", coordinator.DefaultReconcileInterval), "how often to re-push the current IP to connected agents (self-heal; 0 disables)")
 	fs.String("providers", envOr("IPCOD_IP_PROVIDERS", ""), "comma-separated IP echo URLs (default: built-in list)")
 	fs.Bool("no-detect", envBool("IPCOD_NO_DETECT"), "disable outbound public IP detection (set the IP manually or via a beacon check-in)")
 	fs.Bool("v", false, "verbose (debug) logging")
@@ -119,6 +120,7 @@ func runCoordinatorMode(cmd *Command, args []string, dashboard bool) error {
 	adminToken := fs.String("admin-token", os.Getenv("IPCOD_ADMIN_TOKEN"), "admin bearer token for /api/admin")
 	trustProxy := fs.Bool("trust-proxy", envBool("IPCOD_TRUST_PROXY"), "honor X-Forwarded-For (set behind a reverse proxy)")
 	detectInterval := fs.Duration("detect-interval", envDuration("IPCOD_DETECT_INTERVAL", coordinator.DefaultDetectInterval), "public IP re-check interval")
+	reconcileInterval := fs.Duration("reconcile-interval", envDuration("IPCOD_RECONCILE_INTERVAL", coordinator.DefaultReconcileInterval), "how often to re-push the current IP to connected agents (self-heal; 0 disables)")
 	providers := fs.String("providers", envOr("IPCOD_IP_PROVIDERS", ""), "comma-separated IP echo URLs")
 	noDetect := fs.Bool("no-detect", envBool("IPCOD_NO_DETECT"), "disable outbound public IP detection")
 	verbose := fs.Bool("v", false, "verbose logging")
@@ -180,6 +182,11 @@ func runCoordinatorMode(cmd *Command, args []string, dashboard bool) error {
 			Interval:  *detectInterval,
 		})
 	}
+
+	// Periodic re-assertion of the current IP to connected agents. Agents
+	// verify their firewall against it and repair the difference, so pushes
+	// self-heal without requiring an IP change.
+	srv.StartReconcile(detCtx, *reconcileInterval)
 
 	httpSrv := &http.Server{
 		Addr:              effectiveListen,

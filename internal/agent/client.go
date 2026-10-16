@@ -211,28 +211,41 @@ func (c *Client) handle(ctx context.Context, conn *websocket.Conn, msg *protocol
 		c.applyIP(ctx, p)
 
 	case protocol.TypeSetPort:
+		// Legacy frame: the coordinator now pushes the full state via
+		// ip_changed (on change, on connect, and periodically), so a
+		// port-only message is informational.
 		p := msg.SetPort
 		if p == nil {
 			return
 		}
-		c.log.Info("set_port received but requires a current IP to reapply", "port", p.Port)
-		// Port-only changes are applied on the next ip_changed; a full
-		// reconciliation would need the coordinator to resend the IP. The
-		// coordinator does resend on connect, so this is a minor edge.
+		c.log.Debug("ignoring legacy set_port", "port", p.Port, "ports", p.Ports)
 
 	default:
 		c.log.Debug("ignoring message", "type", msg.Type)
 	}
 }
 
-// applyIP applies a firewall rule for the reported laptop IP, honoring the
-// revision counter so stale/duplicate updates are dropped.
+// applyIP converges the firewall to the coordinator's assertion: the current
+// laptop IP and the ports to allow. Pushes are periodic and idempotent — the
+// revision guard only drops strictly-older updates; an equal revision is a
+// re-assertion of the same state and just re-verifies the rules (a no-op when
+// they are already in place).
 func (c *Client) applyIP(ctx context.Context, p *protocol.IPChangedPayload) {
 	_ = ctx
-	// Revision guard: only apply if this is newer than what we have.
+	ports := p.EffectivePorts()
+	if p.IP == "" {
+		c.log.Warn("received empty IP; skipping")
+		return
+	}
+	if len(ports) == 0 {
+		c.log.Warn("received no ports to guard; skipping")
+		return
+	}
+	// Revision guard: strictly older updates are stale; equal ones are
+	// periodic re-assertions that Ensure handles idempotently.
 	for {
 		cur := c.revision.Load()
-		if p.Revision <= cur {
+		if p.Revision < cur {
 			c.log.Debug("stale ip update ignored", "rev", p.Revision, "current", cur)
 			return
 		}
@@ -241,15 +254,14 @@ func (c *Client) applyIP(ctx context.Context, p *protocol.IPChangedPayload) {
 		}
 	}
 
-	if p.IP == "" {
-		c.log.Warn("received empty IP; skipping")
+	changed, err := c.applier.Ensure(p.IP, ports, p.Proto)
+	if err != nil {
+		c.log.Error("failed to apply ufw rule", "ip", p.IP, "ports", ports, "err", err)
 		return
 	}
-	if err := c.applier.Apply(p.IP, p.Port, p.Proto); err != nil {
-		c.log.Error("failed to apply ufw rule", "ip", p.IP, "port", p.Port, "err", err)
-		return
+	if changed {
+		c.log.Info("firewall updated", "ip", p.IP, "ports", ports, "proto", orTCP(p.Proto), "rev", p.Revision)
 	}
-	c.log.Info("firewall updated", "ip", p.IP, "port", p.Port, "proto", orTCP(p.Proto), "rev", p.Revision)
 }
 
 // authError signals a non-retryable authentication problem.

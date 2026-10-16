@@ -3,7 +3,6 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -101,17 +100,29 @@ func (s *Server) SetIP(ctx context.Context, ip string) (bool, uint64, error) {
 	return s.observeIP(ctx, ip, "manual")
 }
 
-// SetPort updates an agent's guard port, persists it, and pushes the new port
-// to the agent if it is connected.
-func (s *Server) SetPort(ctx context.Context, agentID string, port uint16, proto string) error {
-	if port == 0 {
-		return errors.New("port must be between 1 and 65535")
-	}
-	if err := s.store.UpdateAgentPort(ctx, agentID, port, proto); err != nil {
+// SetPort updates an agent's guard ports/proto, persists them, and pushes the
+// current state to the agent if it is connected. Empty ports or proto mean
+// "keep the current value", so a PATCH can change just one of them.
+func (s *Server) SetPort(ctx context.Context, agentID string, ports []uint16, proto string) error {
+	cur, err := s.store.GetAgent(ctx, agentID)
+	if err != nil {
 		return err
 	}
-	// Update the in-memory hub entry and push the current IP with new port.
-	s.hub.setPort(agentID, port, proto)
+	if len(ports) == 0 {
+		ports = cur.Ports
+	}
+	ports, err = normalizePorts(ports)
+	if err != nil {
+		return err
+	}
+	if proto == "" {
+		proto = cur.Proto
+	}
+	if err := s.store.UpdateAgentPorts(ctx, agentID, ports, proto); err != nil {
+		return err
+	}
+	// Update the in-memory hub entry and push the current IP with new ports.
+	s.hub.setPorts(agentID, ports, proto)
 	if ac := s.hub.get(agentID); ac != nil {
 		s.pushCurrentIP(ctx, ac)
 	}

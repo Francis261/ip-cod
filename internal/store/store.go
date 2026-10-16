@@ -8,6 +8,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ipcod/ipcod/internal/token"
@@ -18,15 +21,15 @@ import (
 // ErrNotFound is returned when a queried row does not exist.
 var ErrNotFound = errors.New("store: not found")
 
-// Agent is a registered VPS agent that should guard one port.
+// Agent is a registered VPS agent that should guard one or more ports.
 type Agent struct {
 	ID string
 	// Name is a human-friendly label (e.g. "web-1").
 	Name string
 	// TokenHash is the SHA-256 hex of the agent's bearer token.
 	TokenHash string
-	// Port is the port the agent allows the laptop IP to reach.
-	Port uint16
+	// Ports are the ports the agent allows the laptop IP to reach.
+	Ports []uint16
 	// Proto is "tcp", "udp", or "" (defaults to tcp at the agent).
 	Proto string
 	// Enabled gates whether the agent is allowed to authenticate.
@@ -38,6 +41,14 @@ type Agent struct {
 	// LastRevision is the highest revision we've sent this agent.
 	LastRevision uint64
 	CreatedAt    time.Time
+}
+
+// PrimaryPort is the first guarded port, or 0 when none is set.
+func (a Agent) PrimaryPort() uint16 {
+	if len(a.Ports) == 0 {
+		return 0
+	}
+	return a.Ports[0]
 }
 
 // Beacon is a laptop-side reporter whose source IP the coordinator tracks.
@@ -94,6 +105,7 @@ CREATE TABLE IF NOT EXISTS agents (
 	name        TEXT NOT NULL UNIQUE,
 	token_hash  TEXT NOT NULL UNIQUE,
 	port        INTEGER NOT NULL,
+	ports       TEXT NOT NULL DEFAULT '',
 	proto       TEXT NOT NULL DEFAULT '',
 	enabled     INTEGER NOT NULL DEFAULT 1,
 	last_seen   TEXT NOT NULL DEFAULT '',
@@ -128,14 +140,86 @@ CREATE TABLE IF NOT EXISTS meta (
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
 	}
+	// Additive migration: multi-port support added a `ports` column. Databases
+	// created before it only have the single-port `port` column; existing rows
+	// keep working because reads fall back to it when `ports` is empty.
+	if has, err := hasColumn(ctx, s.db, "agents", "ports"); err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	} else if !has {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE agents ADD COLUMN ports TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("store: migrate ports column: %w", err)
+		}
+	}
 	return nil
+}
+
+// hasColumn reports whether table has the named column. table is only ever a
+// hardcoded identifier from this package (PRAGMA arguments cannot be bound).
+func hasColumn(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid       int
+			name, typ string
+			notNull   int
+			dflt      sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// portsCSV renders a port list for the ports column, e.g. "22,443".
+func portsCSV(ports []uint16) string {
+	parts := make([]string, len(ports))
+	for i, p := range ports {
+		parts[i] = strconv.FormatUint(uint64(p), 10)
+	}
+	return strings.Join(parts, ",")
+}
+
+// parsePorts turns the ports column into a deduplicated, sorted list. An empty
+// column falls back to the legacy single-port column, so agents created before
+// multi-port support keep working unchanged.
+func parsePorts(csv string, legacy uint16) []uint16 {
+	if strings.TrimSpace(csv) == "" {
+		if legacy > 0 {
+			return []uint16{legacy}
+		}
+		return nil
+	}
+	var out []uint16
+	seen := map[uint16]bool{}
+	for _, part := range strings.Split(csv, ",") {
+		n, err := strconv.ParseUint(strings.TrimSpace(part), 10, 16)
+		if err != nil || n == 0 || seen[uint16(n)] {
+			continue
+		}
+		seen[uint16(n)] = true
+		out = append(out, uint16(n))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // ---- Agents ----
 
 // CreateAgent inserts a new agent and returns the generated plaintext token
 // alongside the stored record. The plaintext token is returned exactly once.
-func (s *Store) CreateAgent(ctx context.Context, name string, port uint16, proto string) (*Agent, string, error) {
+func (s *Store) CreateAgent(ctx context.Context, name string, ports []uint16, proto string) (*Agent, string, error) {
+	if len(ports) == 0 {
+		return nil, "", errors.New("store: create agent: at least one port is required")
+	}
 	plain, err := token.Generate(token.KindAgent)
 	if err != nil {
 		return nil, "", err
@@ -149,100 +233,97 @@ func (s *Store) CreateAgent(ctx context.Context, name string, port uint16, proto
 		ID:        id,
 		Name:      name,
 		TokenHash: token.Hash(plain),
-		Port:      port,
+		Ports:     append([]uint16(nil), ports...),
 		Proto:     proto,
 		Enabled:   true,
 		CreatedAt: now,
 	}
 	const q = `
-INSERT INTO agents (id, name, token_hash, port, proto, enabled, created_at)
-VALUES (?, ?, ?, ?, ?, 1, ?)`
+INSERT INTO agents (id, name, token_hash, port, ports, proto, enabled, created_at)
+VALUES (?, ?, ?, ?, ?, ?, 1, ?)`
 	if _, err := s.db.ExecContext(ctx, q,
-		a.ID, a.Name, a.TokenHash, a.Port, a.Proto, a.CreatedAt.Format(time.RFC3339Nano)); err != nil {
+		a.ID, a.Name, a.TokenHash, a.PrimaryPort(), portsCSV(a.Ports), a.Proto,
+		a.CreatedAt.Format(time.RFC3339Nano)); err != nil {
 		return nil, "", fmt.Errorf("store: create agent: %w", err)
 	}
 	return a, plain, nil
 }
 
+// agentCols is the canonical agent column list; scanAgent pairs with it.
+const agentCols = `id, name, token_hash, port, ports, proto, enabled, last_seen, last_ip, last_revision, created_at`
+
+// scanAgent reads one agent row. Rows may carry a stale (pre-migration)
+// empty `ports` value, in which case the legacy `port` column is used.
+func (s *Store) scanAgent(row interface{ Scan(...any) error }) (*Agent, error) {
+	a := &Agent{}
+	var legacyPort int64
+	var portsVal, lastSeen, created string
+	var enabled int
+	if err := row.Scan(&a.ID, &a.Name, &a.TokenHash, &legacyPort, &portsVal, &a.Proto,
+		&enabled, &lastSeen, &a.LastIP, &a.LastRevision, &created); err != nil {
+		return nil, err
+	}
+	a.Ports = parsePorts(portsVal, uint16(legacyPort))
+	a.Enabled = enabled != 0
+	a.LastSeen = parseTime(lastSeen)
+	a.CreatedAt = parseTime(created)
+	return a, nil
+}
+
 // GetAgentByTokenHash looks up an agent by the hash of its bearer token.
 func (s *Store) GetAgentByTokenHash(ctx context.Context, hash string) (*Agent, error) {
-	const q = `
-SELECT id, name, token_hash, port, proto, enabled, last_seen, last_ip, last_revision, created_at
-FROM agents WHERE token_hash = ?`
-	a := &Agent{}
-	var lastSeen string
-	var created string
-	var enabled int
-	err := s.db.QueryRowContext(ctx, q, hash).Scan(
-		&a.ID, &a.Name, &a.TokenHash, &a.Port, &a.Proto, &enabled,
-		&lastSeen, &a.LastIP, &a.LastRevision, &created)
+	a, err := s.scanAgent(s.db.QueryRowContext(ctx,
+		`SELECT `+agentCols+` FROM agents WHERE token_hash = ?`, hash))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("store: get agent by token: %w", err)
 	}
-	a.Enabled = enabled != 0
-	a.LastSeen = parseTime(lastSeen)
-	a.CreatedAt = parseTime(created)
 	return a, nil
 }
 
 // GetAgent fetches one agent by ID.
 func (s *Store) GetAgent(ctx context.Context, id string) (*Agent, error) {
-	const q = `
-SELECT id, name, token_hash, port, proto, enabled, last_seen, last_ip, last_revision, created_at
-FROM agents WHERE id = ?`
-	a := &Agent{}
-	var lastSeen, created string
-	var enabled int
-	err := s.db.QueryRowContext(ctx, q, id).Scan(
-		&a.ID, &a.Name, &a.TokenHash, &a.Port, &a.Proto, &enabled,
-		&lastSeen, &a.LastIP, &a.LastRevision, &created)
+	a, err := s.scanAgent(s.db.QueryRowContext(ctx,
+		`SELECT `+agentCols+` FROM agents WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("store: get agent: %w", err)
 	}
-	a.Enabled = enabled != 0
-	a.LastSeen = parseTime(lastSeen)
-	a.CreatedAt = parseTime(created)
 	return a, nil
 }
 
 // ListAgents returns all agents ordered by name.
 func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
-	const q = `
-SELECT id, name, token_hash, port, proto, enabled, last_seen, last_ip, last_revision, created_at
-FROM agents ORDER BY name`
-	rows, err := s.db.QueryContext(ctx, q)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+agentCols+` FROM agents ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list agents: %w", err)
 	}
 	defer rows.Close()
 	out := []Agent{}
 	for rows.Next() {
-		var a Agent
-		var lastSeen, created string
-		var enabled int
-		if err := rows.Scan(&a.ID, &a.Name, &a.TokenHash, &a.Port, &a.Proto, &enabled,
-			&lastSeen, &a.LastIP, &a.LastRevision, &created); err != nil {
+		a, err := s.scanAgent(rows)
+		if err != nil {
 			return nil, err
 		}
-		a.Enabled = enabled != 0
-		a.LastSeen = parseTime(lastSeen)
-		a.CreatedAt = parseTime(created)
-		out = append(out, a)
+		out = append(out, *a)
 	}
 	return out, rows.Err()
 }
 
-// UpdateAgentPort changes the port/proto an agent guards.
-func (s *Store) UpdateAgentPort(ctx context.Context, id string, port uint16, proto string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE agents SET port = ?, proto = ? WHERE id = ?`, port, proto, id)
+// UpdateAgentPorts changes the ports/proto an agent guards.
+func (s *Store) UpdateAgentPorts(ctx context.Context, id string, ports []uint16, proto string) error {
+	if len(ports) == 0 {
+		return errors.New("store: update agent ports: at least one port is required")
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET port = ?, ports = ?, proto = ? WHERE id = ?`,
+		ports[0], portsCSV(ports), proto, id)
 	if err != nil {
-		return fmt.Errorf("store: update agent port: %w", err)
+		return fmt.Errorf("store: update agent ports: %w", err)
 	}
 	return requireAffected(res)
 }
