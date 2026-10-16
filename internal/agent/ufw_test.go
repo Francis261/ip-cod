@@ -40,9 +40,11 @@ func newTestApplier(f *fakeUFW) *UFWApplier {
 	return u
 }
 
-// statusRule renders one ipcod-tagged rule the way `ufw status` prints it.
+// statusRule renders one ipcod-tagged rule the way real `ufw status` prints it
+// on Ubuntu/Debian — plain "ALLOW" with no "IN" (the parser must also accept
+// "ALLOW IN"/"ALLOW FWD" variants other ufw versions emit).
 func statusRule(portProto, from string) string {
-	return fmt.Sprintf("%-27s ALLOW IN    %-22s # ipcod", portProto, from)
+	return fmt.Sprintf("%-27s ALLOW    %-22s # ipcod", portProto, from)
 }
 
 func statusOf(rules ...string) string {
@@ -248,14 +250,17 @@ func TestParseStatus(t *testing.T) {
 	out := statusOf(
 		statusRule("22/tcp", "1.2.3.4"),
 		statusRule("443/tcp", "2001:db8::1"),
-		"80                         ALLOW IN    Anywhere                 # ipcod",
+		// Other ufw versions print the direction word; must parse too:
+		"8443/tcp                   ALLOW IN    5.6.7.8              # ipcod",
+		// Not ours / not rules we ever create:
+		"80                         ALLOW    Anywhere              # ipcod",
 		"3306/tcp                   DENY IN     Anywhere                 # ipcod",
-		"8080/tcp                   ALLOW IN    Anywhere",
-		"53/udp                     ALLOW IN    5.6.7.8", // not tagged: not ours
+		"8080/tcp                   ALLOW    Anywhere",
+		"53/udp                     ALLOW    5.6.7.8", // not tagged
 	)
 	got := parseStatus(out)
-	if len(got) != 2 {
-		t.Fatalf("parseStatus = %v, want exactly the two tagged non-Anywhere allows", got)
+	if len(got) != 3 {
+		t.Fatalf("parseStatus = %v, want exactly the three tagged non-Anywhere allows", got)
 	}
 	r, ok := got["22/tcp"]
 	if !ok || r.ip != "1.2.3.4" || r.proto != "tcp" {
@@ -264,6 +269,10 @@ func TestParseStatus(t *testing.T) {
 	r, ok = got["443/tcp"]
 	if !ok || r.ip != "2001:db8::1" {
 		t.Fatalf("missing v6 443/tcp rule: %v", got)
+	}
+	r, ok = got["8443/tcp"]
+	if !ok || r.ip != "5.6.7.8" {
+		t.Fatalf("missing ALLOW-IN-style 8443/tcp rule: %v", got)
 	}
 }
 

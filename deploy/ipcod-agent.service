@@ -16,19 +16,26 @@ RestartSec=3
 User=root
 
 NoNewPrivileges=no
-# NOTE: ProtectSystem must stay "full", NOT "strict". "full" makes /usr and
-# /boot read-only but leaves /etc writable, which ufw needs to persist rules
-# to /etc/ufw/. Switching to "strict" makes the whole tree read-only and ufw
-# allow/deny will silently fail to save rules across reloads.
+# ufw persists its rules under /etc/ufw, so that directory must stay
+# writable. NOTE: on current systemd (255/Ubuntu 24.04) even
+# ProtectSystem=full renders /etc read-only, which makes every `ufw
+# allow`/`delete` fail with "'/etc/ufw/user.rules' is not writable" — so we
+# carve out the exact path ufw needs instead of relying on full/strict
+# semantics.
 ProtectSystem=full
+ReadWritePaths=/etc/ufw
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=no
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-# The agent only makes outbound connections to the coordinator.
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The agent only makes outbound connections to the coordinator, plus the
+# netlink socket ufw/iptables-nft needs to inspect and manage netfilter.
+# Without AF_NETLINK, every `ufw status`/`allow`/`delete` fails with
+# "Couldn't determine iptables version" (iptables-nft opens netlink even for
+# version detection), so the agent could never apply a rule.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 # ufw needs to manage netfilter; allow the specific sysctls it touches.
 ProtectKernelModules=no
 

@@ -190,9 +190,10 @@ func (u *UFWApplier) syncSimLocked(toDelete, toAdd []rule) {
 }
 
 // parseStatus extracts the ipcod-tagged allow rules from `ufw status` output.
-// A managed line looks like:
+// A managed line looks like (ufw prints the action as "ALLOW", "ALLOW IN" or
+// "ALLOW FWD" depending on version — the FROM value follows the action words):
 //
-//	22/tcp    ALLOW IN    1.2.3.4    # ipcod
+//	22/tcp    ALLOW    1.2.3.4    # ipcod
 //
 // Only lines carrying our comment are considered, so rules the user added
 // themselves are never touched.
@@ -203,7 +204,7 @@ func parseStatus(out string) map[string]rule {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 4 {
+		if len(fields) < 3 {
 			continue
 		}
 		ai := -1
@@ -213,11 +214,18 @@ func parseStatus(out string) map[string]rule {
 				break
 			}
 		}
-		// Layout: <port[/proto]> ALLOW IN <from> # ipcod
-		if ai < 1 || ai+2 >= len(fields) || !strings.EqualFold(fields[ai+1], "IN") {
+		// Layout: <port[/proto]> ALLOW [IN|FWD] <from> # ipcod
+		if ai < 1 || ai+1 >= len(fields) {
 			continue
 		}
-		from := fields[ai+2]
+		j := ai + 1
+		if strings.EqualFold(fields[j], "IN") || strings.EqualFold(fields[j], "FWD") {
+			j++
+		}
+		if j >= len(fields) {
+			continue
+		}
+		from := fields[j]
 		if strings.EqualFold(from, "anywhere") {
 			continue // we never add From-Anywhere rules; not ours
 		}
